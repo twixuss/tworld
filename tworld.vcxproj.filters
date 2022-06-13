@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\grid_map.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\cbuffer.h" />
+    <ClInclude Include="src\d3d11.h" />
+    <ClInclude Include="src\input.h" />
+    <ClInclude Include="src\common.h" />
+  </ItemGroup>
+</Project>
