@@ -8,6 +8,8 @@ extern ID3D11RenderTargetView *back_buffer;
 extern ID3D11InfoQueue* debug_info_queue;
 
 inline void print_messages() {
+    if (!debug_info_queue)
+        return;
     UINT64 message_count = debug_info_queue->GetNumStoredMessages();
 
     for(UINT64 i = 0; i < message_count; i++){
