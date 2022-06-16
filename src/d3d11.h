@@ -35,3 +35,39 @@ inline void dhr(HRESULT hr, std::source_location location = std::source_location
         debug_break();
     }
 }
+
+template <umm w, umm h>
+inline ID3D11ShaderResourceView *make_texture(v4u8 (&pixels)[w][h]) {
+	ID3D11Texture2D *resource;
+	{
+		D3D11_TEXTURE2D_DESC desc {
+			.Width = w,
+			.Height = h,
+			.MipLevels = log2(ceil_to_power_of_2(max(w,h)))+1,
+			.ArraySize = 1,
+			.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+			.SampleDesc = {1,0},
+			.BindFlags = D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET,
+			.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS,
+		};
+
+		dhr(device->CreateTexture2D(&desc, 0, &resource));
+		immediate_context->UpdateSubresource(resource, 0, 0, pixels, w*sizeof(v4u8), 1);
+	}
+
+	ID3D11ShaderResourceView *view;
+	{
+		D3D11_SHADER_RESOURCE_VIEW_DESC desc {
+			.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+			.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
+			.Texture2D = {
+				.MipLevels = (UINT)-1,
+			},
+		};
+		dhr(device->CreateShaderResourceView(resource, &desc, &view));
+	}
+
+	immediate_context->GenerateMips(view);
+
+	return view;
+}

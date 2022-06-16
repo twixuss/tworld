@@ -15,6 +15,8 @@
 #include <tl/cpu.h>
 #include <tl/simd.h>
 
+#pragma comment(lib, "freetype.lib")
+
 using namespace tl;
 
 #include <dxgi1_6.h>
@@ -26,6 +28,14 @@ using namespace tl;
 #include "cbuffer.h"
 #include "input.h"
 #include "common.h"
+
+#include <freetype/freetype.h>
+#define TL_FONT_TEXTURE_HANDLE ID3D11ShaderResourceView *
+#include <tl/font.h>
+
+#define USE_INDICES 0
+
+FontCollection *font_collection;
 
 HWND hwnd;
 IDXGISwapChain *swap_chain = 0;
@@ -50,6 +60,7 @@ ID3D11RasterizerState *wireframe_rasterizer;
 bool wireframe_rasterizer_enabled;
 
 ID3D11BlendState *alpha_blend;
+ID3D11BlendState *font_blend;
 
 ID3D11VertexShader *chunk_vs = 0;
 ID3D11PixelShader *chunk_solid_ps = 0;
@@ -66,6 +77,52 @@ ID3D11PixelShader  *blit_ps = 0;
 
 ID3D11VertexShader *shadow_vs = 0;
 ID3D11PixelShader  *shadow_ps = 0;
+
+ID3D11VertexShader *font_vs = 0;
+ID3D11PixelShader  *font_ps = 0;
+
+ID3D11VertexShader *crosshair_vs = 0;
+ID3D11PixelShader  *crosshair_ps = 0;
+
+ID3D11ShaderResourceView *font_vertex_buffer = 0;
+
+struct FontVertex {
+	v2f position;
+	v2f uv;
+};
+
+template <class T>
+struct StatValue {
+	T current = {};
+	T min = max_value<T>;
+	T max = min_value<T>;
+	T sum = {};
+	u32 count = 0;
+
+	void set(T value) {
+		current = value;
+		min = ::min(min, value);
+		max = ::max(max, value);
+		sum += value;
+		count++;
+	}
+	void reset() {
+		min = max_value<T>;
+		max = min_value<T>;
+		sum = {};
+		count = 0;
+	}
+
+	T avg() { return count ? sum / count : T{}; }
+};
+
+template <class T>
+inline umm append(StringBuilder &builder, StatValue<T> stat) {
+	return append_format(builder, "{}|{}|{}|{}", stat.current, stat.min, stat.max, stat.avg());
+}
+
+StatValue<f32> actual_fps;
+f32 smooth_fps;
 
 struct alignas(16) FrameCbuffer {
     m4 mvp;
@@ -151,8 +208,27 @@ struct ChunkRelativePosition {
 	}
 };
 
-ChunkRelativePosition camera_position = {0,1,0};
-ChunkRelativePosition prev_camera_position;
+umm append(StringBuilder &builder, ChunkRelativePosition p) {
+	return append_format(builder, "{}+{}", p.chunk, p.local);
+}
+
+enum class EntityKind {
+	camera,
+	grenade,
+};
+
+struct Entity {
+	EntityKind kind = {};
+	ChunkRelativePosition position = {};
+	ChunkRelativePosition prev_position = {};
+	union {
+		struct {
+			f32 timer;
+		} grenade;
+	};
+};
+LinkedList<Entity> entities;
+
 
 enum class CameraMode {
 	walk,
@@ -166,6 +242,9 @@ v3f camera_angles;
 
 f32 camera_fov = 90;
 
+Entity *camera;
+v3s camera_chunk_last_frame;
+
 struct NeighborMask {
 	bool x : 1;
 	bool y : 1;
@@ -175,13 +254,22 @@ struct NeighborMask {
 
 struct Chunk {
 	ID3D11ShaderResourceView *vertex_buffer = 0;
-	u32 vert_count = 0;
-	u32 lod_width = 1;
-	Mutex mutex;
-	bool sdf_generated = false;
+#if USE_INDICES
+	ID3D11Buffer *index_buffer = 0;
+#endif
 	List<v3f> vertices;
-	NeighborMask neighbor_mask = {};
+#if USE_INDICES
+	List<u32> indices;
+	u32 indices_count = 0;
+#else
+	u32 vert_count = 0;
+#endif
+	u32 lod_width = 1;
 	f32 time_since_remesh = 0;
+	Mutex mutex;
+	NeighborMask neighbor_mask = {};
+	bool sdf_generated = false;
+	bool was_modified = false;
 #if 0
 	Array<Array<Array<s8, CHUNKW>, CHUNKW>, CHUNKW> sdf;
 #else
@@ -206,14 +294,20 @@ int _____ = sizeof Chunk;
 
 Chunk &get_chunk(s32 x, s32 y, s32 z) {
 	s32 const s = DRAWD*2+1;
-	x += DRAWD;
-	y += DRAWD;
-	z += DRAWD;
 	return chunks[frac(x, s)][frac(y, s)][frac(z, s)];
 }
 Chunk &get_chunk(v3s v) {
 	return get_chunk(v.x, v.y, v.z);
 }
+
+// (0 4) (1 4)|(2 4) (3 4) (4 4)
+// (0 3) (1 3)|(2 3) (3 3) <4 3>
+// (0 2) (1 2)|(2 2) (3 2) (4 2)
+// (0 1) (1 1)|(2 1) (3 1) (4 1)
+// -----------------------------
+// (0 0) (1 0)|(2 0) (3 0) (4 0)
+
+// camera_chunk = (4 3)
 
 v3s get_chunk_position(Chunk *chunk) {
 	auto index = chunk - (Chunk *)&chunks[0][0][0];
@@ -224,14 +318,15 @@ v3s get_chunk_position(Chunk *chunk) {
 		(index / s) % s,
 		index % s,
 	};
-	v -= DRAWD;
 
-	while (v.x < -DRAWD) v.x += s;
-	while (v.y < -DRAWD) v.y += s;
-	while (v.z < -DRAWD) v.z += s;
-	while (v.x > DRAWD) v.x -= s;
-	while (v.y > DRAWD) v.y -= s;
-	while (v.z > DRAWD) v.z -= s;
+	v += floor(camera->position.chunk+DRAWD, s);
+
+	v -= s * (v3s)(v > camera->position.chunk+DRAWD);
+
+	auto r = absolute(v - camera->position.chunk);
+	assert(-DRAWD <= r.x && r.x <= DRAWD);
+	assert(-DRAWD <= r.y && r.y <= DRAWD);
+	assert(-DRAWD <= r.z && r.z <= DRAWD);
 
 	return v;
 }
@@ -240,9 +335,9 @@ template <class Fn>
 void for_each_chunk(Fn &&fn) {
 	timed_function(profiler, profile_frame);
 
-	for (s32 x = camera_position.chunk.x-DRAWD; x <= camera_position.chunk.x+DRAWD; ++x) {
-	for (s32 y = camera_position.chunk.y-DRAWD; y <= camera_position.chunk.y+DRAWD; ++y) {
-	for (s32 z = camera_position.chunk.z-DRAWD; z <= camera_position.chunk.z+DRAWD; ++z) {
+	for (s32 x = camera->position.chunk.x-DRAWD; x <= camera->position.chunk.x+DRAWD; ++x) {
+	for (s32 y = camera->position.chunk.y-DRAWD; y <= camera->position.chunk.y+DRAWD; ++y) {
+	for (s32 z = camera->position.chunk.z-DRAWD; z <= camera->position.chunk.z+DRAWD; ++z) {
 		fn(get_chunk(x,y,z), {x,y,z});
 	}
 	}
@@ -260,19 +355,19 @@ NeighborMask get_neighbor_mask(v3s position) {
 
 	NeighborMask mask;
 	mask.x =
-		(position - camera_position.chunk).x != DRAWD &&
+		(position - camera->position.chunk).x != DRAWD &&
 		_100 &&
 		_110 &&
 		_101 &&
 		_111;
 	mask.y =
-		(position - camera_position.chunk).y != DRAWD &&
+		(position - camera->position.chunk).y != DRAWD &&
 		_010 &&
 		_110 &&
 		_011 &&
 		_111;
 	mask.z =
-		(position - camera_position.chunk).z != DRAWD &&
+		(position - camera->position.chunk).z != DRAWD &&
 		_001 &&
 		_101 &&
 		_011 &&
@@ -280,6 +375,32 @@ NeighborMask get_neighbor_mask(v3s position) {
 	return mask;
 }
 
+struct V3sHashTraits : DefaultHashTraits<v3s> {
+	inline static u64 get_hash(v3s a) {
+		auto const s = DRAWD*2+1;
+		return
+			a.x * s * s +
+			a.y * s +
+			a.z;
+	}
+	inline static bool are_equal(v3s a, v3s b) {
+		return
+			(a.x == b.x) &
+			(a.y == b.y) &
+			(a.z == b.z);
+	}
+};
+
+struct SavedChunk {
+	s8 sdf[CHUNKW][CHUNKW][CHUNKW];
+};
+
+HashMap<v3s, SavedChunk, V3sHashTraits> saved_chunks;
+
+void save_chunk(Chunk &chunk, v3s chunk_position) {
+	auto &saved = saved_chunks.get_or_insert(chunk_position);
+	memcpy(saved.sdf, chunk.sdf0, sizeof(chunk.sdf0));
+}
 struct Vertex {
 	v3f position;
 	v3f normal;
@@ -922,7 +1043,14 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 		}
 	}
 
-	StaticList<Vertex, lodw*lodw*lodw*6*3> vertices;
+
+	StaticList<Vertex, pow3(lodw+3)*6> vertices;
+
+#if USE_INDICES
+	u32 index_grid[lodw+3][lodw+3][lodw+3];
+	memset(index_grid, -1, sizeof(index_grid));
+	StaticList<u32, pow3(lodw+3)*6> indices;
+#endif
 
 #if 0
 	// points
@@ -943,56 +1071,68 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 
 			s32 const o = CHUNKW / lodw;
 
+			auto add = [&](v3s v) {
+#if USE_INDICES
+				if (index_grid[v.x][v.y][v.z] == -1) {
+					index_grid[v.x][v.y][v.z] = vertices.count;
+					vertices.add(points[v.x][v.y][v.z]);
+				}
+				indices.add(index_grid[v.x][v.y][v.z]);
+#else
+				vertices.add(points[v.x][v.y][v.z]);
+#endif
+			};
+
 			if ((sdf(lx,ly,lz) > 0) != (sdf(lx+1,ly,lz) > 0)) {
-				auto _0 = points[lx][ly-1][lz-1]; // 0
-				auto _1 = points[lx][ly+0][lz-1]; // 1
-				auto _2 = points[lx][ly-1][lz+0]; // 2
-				auto _3 = points[lx][ly+0][lz+0]; // 3
+				v3s _0 = {lx, ly-1, lz-1};
+				v3s _1 = {lx, ly+0, lz-1};
+				v3s _2 = {lx, ly-1, lz+0};
+				v3s _3 = {lx, ly+0, lz+0};
 
 				if (!(sdf(lx,ly,lz) > 0)) {
 					swap(_0, _3);
 				}
 
-				vertices.add(_0);
-				vertices.add(_1);
-				vertices.add(_2);
-				vertices.add(_1);
-				vertices.add(_3);
-				vertices.add(_2);
+				add(_0);
+				add(_1);
+				add(_2);
+				add(_1);
+				add(_3);
+				add(_2);
 			}
 			if ((sdf(lx,ly,lz) > 0) != (sdf(lx,ly+1,lz) > 0)) {
-				auto _0 = points[lx-1][ly][lz-1]; // 0
-				auto _1 = points[lx+0][ly][lz-1]; // 1
-				auto _2 = points[lx-1][ly][lz+0]; // 2
-				auto _3 = points[lx+0][ly][lz+0]; // 3
+				v3s _0 = {lx-1, ly, lz-1};
+				v3s _1 = {lx+0, ly, lz-1};
+				v3s _2 = {lx-1, ly, lz+0};
+				v3s _3 = {lx+0, ly, lz+0};
 
 				if (sdf(lx,ly,lz) > 0) {
 					swap(_0, _3);
 				}
 
-				vertices.add(_0);
-				vertices.add(_1);
-				vertices.add(_2);
-				vertices.add(_1);
-				vertices.add(_3);
-				vertices.add(_2);
+				add(_0);
+				add(_1);
+				add(_2);
+				add(_1);
+				add(_3);
+				add(_2);
 			}
 			if ((sdf(lx,ly,lz) > 0) != (sdf(lx,ly,lz+1) > 0)) {
-				auto _0 = points[lx-1][ly-1][lz]; // 0
-				auto _1 = points[lx+0][ly-1][lz]; // 1
-				auto _2 = points[lx-1][ly+0][lz]; // 2
-				auto _3 = points[lx+0][ly+0][lz]; // 3
+				v3s _0 = {lx-1, ly-1, lz};
+				v3s _1 = {lx+0, ly-1, lz};
+				v3s _2 = {lx-1, ly+0, lz};
+				v3s _3 = {lx+0, ly+0, lz};
 
 				if (!(sdf(lx,ly,lz) > 0)) {
 					swap(_0, _3);
 				}
 
-				vertices.add(_0);
-				vertices.add(_1);
-				vertices.add(_2);
-				vertices.add(_1);
-				vertices.add(_3);
-				vertices.add(_2);
+				add(_0);
+				add(_1);
+				add(_2);
+				add(_1);
+				add(_3);
+				add(_2);
 			}
 		}
 		}
@@ -1004,21 +1144,36 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 		chunk.vertex_buffer->Release();
 		chunk.vertex_buffer = 0;
 	}
-
 	chunk.vertices.clear();
+
+#if USE_INDICES
+	if (chunk.index_buffer) {
+		chunk.index_buffer->Release();
+		chunk.index_buffer = 0;
+	}
+	chunk.indices.clear();
+#endif
+
 
 	if (!vertices.count)
 		return;
 
 	for (auto vertex : vertices)
 		chunk.vertices.add(vertex.position);
+	chunk.vert_count = vertices.count;
+
+#if USE_INDICES
+	for (auto index : indices)
+		chunk.indices.add(index);
+	chunk.indices_count = indices.count;
+#endif
 
 	timed_block(profiler, profile_frame, "buffer generation");
 
-	chunk.vert_count = vertices.count;
 
 	ID3D11Buffer *vertex_buffer;
 	defer { vertex_buffer->Release(); };
+
 	{
 		D3D11_BUFFER_DESC desc {
 			.ByteWidth = (UINT)(sizeof(vertices[0]) * vertices.count),
@@ -1038,7 +1193,23 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 		dhr(device->CreateShaderResourceView(vertex_buffer, 0, &chunk.vertex_buffer));
 	}
 
-	vertices.clear();
+#if USE_INDICES
+	{
+		D3D11_BUFFER_DESC desc {
+			.ByteWidth = (UINT)(sizeof(indices[0]) * indices.count),
+			.Usage = D3D11_USAGE_DEFAULT,
+			.BindFlags = D3D11_BIND_SHADER_RESOURCE,
+			.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+			.StructureByteStride = sizeof(indices[0]),
+		};
+
+		D3D11_SUBRESOURCE_DATA init {
+			.pSysMem = indices.data,
+		};
+
+		dhr(device->CreateBuffer(&desc, &init, &chunk.index_buffer));
+	}
+#endif
 
 	chunk.time_since_remesh = 0;
 
@@ -1070,7 +1241,7 @@ void start() {
 FrustumPlanes frustum;
 
 bool chunk_in_view(v3s position) {
-	auto relative_position = (v3f)((position-camera_position.chunk)*CHUNKW);
+	auto relative_position = (v3f)((position-camera->position.chunk)*CHUNKW);
 	return contains_sphere(frustum, relative_position+V3f(CHUNKW/2), sqrt3*CHUNKW);
 }
 
@@ -1103,14 +1274,11 @@ struct ChunkAndPosition {
 	}
 #endif
 
-v3s r;
 u32 iter_from_center_offset_sdf = 0;
 u32 iter_from_center_offset_mesh = 0;
 
 void generate_chunks_around() {
 	timed_function(profiler, profile_frame);
-
-	constexpr auto cell_threshold = pow3(8);
 
 	auto avg_sdf_generation_seconds = total_sdfs_generated ? (f32)(total_time_wasted_on_generating_sdfs / total_sdfs_generated) / performance_frequency : 0.1f;
 	// NOTE: this assumes that sdf generation takes 25% of a frame
@@ -1119,63 +1287,49 @@ void generate_chunks_around() {
 
 	auto work = make_work_queue(thread_pool);
 
-	if (any_true(prev_camera_position.chunk != camera_position.chunk)) {
+	if (any_true(camera_chunk_last_frame != camera->position.chunk)) {
 		timed_block(profiler, profile_frame, "remove chunks");
 		iter_from_center_offset_sdf = 0;
 		iter_from_center_offset_mesh = 0;
-#if 1
-		for (s32 x = prev_camera_position.chunk.x-DRAWD; x <= prev_camera_position.chunk.x+DRAWD; ++x) {
-		for (s32 y = prev_camera_position.chunk.y-DRAWD; y <= prev_camera_position.chunk.y+DRAWD; ++y) {
-		for (s32 z = prev_camera_position.chunk.z-DRAWD; z <= prev_camera_position.chunk.z+DRAWD; ++z) {
-			if (camera_position.chunk.x-DRAWD <= x && x <= camera_position.chunk.x+DRAWD)
-			if (camera_position.chunk.y-DRAWD <= y && y <= camera_position.chunk.y+DRAWD)
-			if (camera_position.chunk.z-DRAWD <= z && z <= camera_position.chunk.z+DRAWD)
+
+		for (s32 x = camera_chunk_last_frame.x-DRAWD; x <= camera_chunk_last_frame.x+DRAWD; ++x) {
+		for (s32 y = camera_chunk_last_frame.y-DRAWD; y <= camera_chunk_last_frame.y+DRAWD; ++y) {
+		for (s32 z = camera_chunk_last_frame.z-DRAWD; z <= camera_chunk_last_frame.z+DRAWD; ++z) {
+			if (camera->position.chunk.x-DRAWD <= x && x <= camera->position.chunk.x+DRAWD)
+			if (camera->position.chunk.y-DRAWD <= y && y <= camera->position.chunk.y+DRAWD)
+			if (camera->position.chunk.z-DRAWD <= z && z <= camera->position.chunk.z+DRAWD)
 				continue;
 
-			r = absolute(v3s{x,y,z} - camera_position.chunk);
+			auto chunk_position = v3s{x,y,z};
+
+			auto r = absolute(chunk_position - camera->position.chunk);
 			assert(r.x > DRAWD || r.y > DRAWD || r.z > DRAWD);
-			auto &chunk = get_chunk(x,y,z);
+			auto &chunk = get_chunk(chunk_position);
 			if (chunk.vertex_buffer) {
 				chunk.vertex_buffer->Release();
 				chunk.vertex_buffer = 0;
 			}
+			chunk.vert_count = 0;
+#if USE_INDICES
+			if (chunk.index_buffer) {
+				chunk.index_buffer->Release();
+				chunk.index_buffer = 0;
+			}
+			chunk.indices_count = 0;
+#endif
 			chunk.sdf_generated = false;
 			chunk.lod_width = 0;
-			chunk.vert_count = 0;
 			chunk.neighbor_mask = {};
+
+			if (chunk.was_modified) {
+				chunk.was_modified = false;
+				save_chunk(chunk, chunk_position);
+			}
+
 			find_and_erase_unordered(chunks_with_meshes, &chunk);
 		}
 		}
 		}
-#else
-		auto before = aabb_center_radius(prev_camera_position.chunk, V3s(DRAWD));
-		auto after  = aabb_center_radius(camera_position.chunk, V3s(DRAWD));
-
-		auto left_volumes = subtract_points(before, after);
-
-		print("XX: {}\n", left_volumes.count);
-
-		for (auto volume : left_volumes) {
-			print("  {} {}\n", volume.min, volume.max);
-			for (s32 x = volume.min.x; x < volume.max.x; ++x) {
-			for (s32 y = volume.min.y; y < volume.max.y; ++y) {
-			for (s32 z = volume.min.z; z < volume.max.z; ++z) {
-				assert(absolute(x - camera_position.chunk.x) > DRAWD);
-				assert(absolute(y - camera_position.chunk.y) > DRAWD);
-				assert(absolute(z - camera_position.chunk.z) > DRAWD);
-				auto &chunk = get_chunk(x,y,z);
-				if (chunk.vertex_buffer) {
-					chunk.vertex_buffer->Release();
-					chunk.vertex_buffer = 0;
-				}
-
-				chunk.sdf_generated = false;
-				chunk.lod_width = 0;
-			}
-			}
-			}
-		}
-#endif
 	}
 	{
 		timed_block(profiler, profile_frame, "generate sdfs");
@@ -1183,7 +1337,7 @@ void generate_chunks_around() {
 		for (auto pp_small = grid_map.begin() + iter_from_center_offset_sdf; pp_small != grid_map.end(); ++pp_small) {
 			auto &p_small = *pp_small;
 			auto p = (v3s)p_small;
-			auto chunk_position = camera_position.chunk + p;
+			auto chunk_position = camera->position.chunk + p;
 			auto &chunk = get_chunk(chunk_position);
 			if (!chunk.sdf_generated) {
 				if (!reached_not_generated) {
@@ -1191,9 +1345,15 @@ void generate_chunks_around() {
 					iter_from_center_offset_sdf = pp_small - grid_map.data;
 				}
 				//if (chunk_in_view(chunk_position)) {
-					work.push([chunk = &chunk, chunk_position]{
-						generate_sdf(*chunk, chunk_position);
-					});
+					if (auto found = saved_chunks.find(chunk_position)) {
+						memcpy(chunk.sdf0, found->value.sdf, sizeof(chunk.sdf0));
+						filter_sdf(chunk);
+						chunk.sdf_generated = true;
+					} else {
+						work.push([chunk = &chunk, chunk_position]{
+							generate_sdf(*chunk, chunk_position);
+						});
+					}
 					n_sdfs_generated += 1;
 					if (n_sdfs_generated == n_sdfs_can_generate_this_frame) {
 						goto _end;
@@ -1205,8 +1365,6 @@ void generate_chunks_around() {
 	}
 	{
 		timed_block(profiler, profile_frame, "remesh chunks");
-
-		u32 cells[16] = {};
 
 		auto remesh = [&] (Chunk *chunk, v3s chunk_position) {
 			work.push([chunk, chunk_position, lod_width = chunk->lod_width] {
@@ -1226,14 +1384,12 @@ void generate_chunks_around() {
 
 		u32 remesh_count = 0;
 
-		u32 cells_ = 0;
-
 		bool reached_not_generated = false;
 
 		for (auto pp_small = grid_map.begin() + iter_from_center_offset_mesh; pp_small != grid_map.end(); ++pp_small) {
 			auto &p_small = *pp_small;
 			auto p = (v3s)p_small;
-			auto chunk_position = camera_position.chunk + p;
+			auto chunk_position = camera->position.chunk + p;
 
 			auto lodw = get_lodw_from_distance(max(absolute(p.x),absolute(p.y),absolute(p.z)));
 			auto lod_index = log2(lodw);
@@ -1246,7 +1402,6 @@ void generate_chunks_around() {
 
 			auto &chunk = get_chunk(chunk_position);
 
-			//if (cells[lod_index] < cell_threshold) {
 			if (chunk.sdf_generated) {
 				auto new_neighbor_mask = get_neighbor_mask(chunk_position);
 				if (chunk.neighbor_mask != new_neighbor_mask) {
@@ -1282,25 +1437,15 @@ void generate_chunks_around() {
 
 				if (did_remesh) {
 					remesh_count++;
-					//cells[lod_index] += chunk.lod_width*chunk.lod_width*chunk.lod_width;
-					cells_ += chunk.lod_width*chunk.lod_width*chunk.lod_width;
-
-					//bool may_do_more = false;
-					//for (u32 i = 0; i < log2(CHUNKW); ++i) {
-					//	may_do_more |= cells[i] < cell_threshold;
-					//}
-					//if (!may_do_more)
-					//	goto _end2;
-
-					if (cells_ >- cell_threshold) {
-						goto _end2;
-					}
 				}
 			} else {
 				did_remesh = true;
 			}
 
-			bool has_full_mesh = chunk.sdf_generated && chunk.neighbor_mask.x && chunk.neighbor_mask.y && chunk.neighbor_mask.z;
+			bool has_full_mesh =
+				any_true(chunk_position == camera->position.chunk + DRAWD) ?
+				chunk.sdf_generated && (chunk.neighbor_mask.x || chunk.neighbor_mask.y || chunk.neighbor_mask.z) : // these are on the edge of draw distance, they will never have neighbors therefore full mesh
+				chunk.sdf_generated && chunk.neighbor_mask.x && chunk.neighbor_mask.y && chunk.neighbor_mask.z; //
 
 			if (!has_full_mesh) {
 				if (!reached_not_generated) {
@@ -1341,8 +1486,8 @@ RayHit global_raycast(ChunkRelativePosition origin_crp, v3f direction, f32 max_d
 
 	auto end   = origin_crp + direction * max_distance;
 
-	v3s _min = min(origin_crp.chunk, end.chunk) - 1;
-	v3s _max = max(origin_crp.chunk, end.chunk) + 1;
+	v3s _min = min(origin_crp.chunk, end.chunk) - 1; // account for extended mesh from chunks behind
+	v3s _max = max(origin_crp.chunk, end.chunk);
 
 	for (s32 x = _min.x; x <= _max.x; ++x) {
 	for (s32 y = _min.y; y <= _max.y; ++y) {
@@ -1356,10 +1501,17 @@ RayHit global_raycast(ChunkRelativePosition origin_crp, v3f direction, f32 max_d
 		auto ray = ray_origin_direction(origin.to_v3f(), direction);
 
 		if (raycast(ray, aabb_min_max(v3f{}, V3f(CHUNKW+2)), true)) {
+#if USE_INDICES
+			for (u32 i = 0; i < chunk.indices.count; i += 3) {
+				auto a = chunk.vertices[chunk.indices[i+0]];
+				auto b = chunk.vertices[chunk.indices[i+1]];
+				auto c = chunk.vertices[chunk.indices[i+2]];
+#else
 			for (u32 i = 0; i < chunk.vertices.count; i += 3) {
 				auto a = chunk.vertices[i+0];
 				auto b = chunk.vertices[i+1];
 				auto c = chunk.vertices[i+2];
+#endif
 
 				if (auto hit = raycast(ray, triangle{a,b,c})) {
 					if (!result || hit.distance < result.distance) {
@@ -1409,9 +1561,191 @@ void unlock_cursor() {
 	show_cursor();
 }
 
+s32 brush_size = 8;
 ChunkRelativePosition cursor_position;
 
+void add_sdf_sphere(ChunkRelativePosition position, s32 radius, s32 strength) {
+	timed_function(profiler, profile_frame);
+
+	v3s center = round_to_int(position.local);
+
+	v3s cmin = position.chunk + floor(center - radius-4, V3s(CHUNKW)) / CHUNKW;
+	v3s cmax = position.chunk + ceil (center + radius+2, V3s(CHUNKW)) / CHUNKW;
+
+	auto add_sdf = [&](s32 x, s32 y, s32 z, s32 delta) {
+		if (delta == 0)
+			return;
+
+		v3s c = position.chunk;
+		while (x < 0) { x += CHUNKW; c.x -= 1; }
+		while (y < 0) { y += CHUNKW; c.y -= 1; }
+		while (z < 0) { z += CHUNKW; c.z -= 1; }
+		while (x >= CHUNKW) { x -= CHUNKW; c.x += 1; }
+		while (y >= CHUNKW) { y -= CHUNKW; c.y += 1; }
+		while (z >= CHUNKW) { z -= CHUNKW; c.z += 1; }
+
+		auto &chunk = get_chunk(c);
+		if (!chunk.sdf_generated)
+			return;
+		chunk.sdf0[x][y][z] = clamp(chunk.sdf0[x][y][z] + delta, -128, 127);
+	};
+
+	for (s32 x = -radius; x <= radius; ++x) {
+	for (s32 y = -radius; y <= radius; ++y) {
+	for (s32 z = -radius; z <= radius; ++z) {
+		auto c = center + v3s{x,y,z};
+		s32 d = (1 - min(radius, length(V3f(x,y,z))) / radius) * strength;
+		add_sdf(c.x, c.y, c.z, d);
+	}
+	}
+	}
+
+	for (s32 x = cmin.x; x < cmax.x; ++x) {
+	for (s32 y = cmin.y; y < cmax.y; ++y) {
+	for (s32 z = cmin.z; z < cmax.z; ++z) {
+		auto &chunk = get_chunk(x,y,z);
+		filter_sdf(chunk);
+	}
+	}
+	}
+
+	auto work = make_work_queue(thread_pool);
+
+	for (s32 x = cmin.x; x < cmax.x; ++x) {
+	for (s32 y = cmin.y; y < cmax.y; ++y) {
+	for (s32 z = cmin.z; z < cmax.z; ++z) {
+		auto &chunk = get_chunk(x,y,z);
+		if (chunk.sdf_generated) {
+			chunk.was_modified = true;
+			work.push([chunk = &chunk, chunk_position = v3s{x,y,z}] {
+				update_chunk_mesh(*chunk, chunk_position, chunk->lod_width);
+			});
+		}
+	}
+	}
+	}
+
+	work.wait_for_completion();
+}
+
+Optional<s8> sdf_at(ChunkRelativePosition position) {
+	auto &chunk = get_chunk(position.chunk);
+	if (!chunk.sdf_generated)
+		return {};
+
+	auto l = floor_to_int(position.local);
+	return chunk.sdf0[l.x][l.y][l.z];
+}
+Optional<s8> sdf_at(v3s chunk_position, v3s l) {
+	auto &chunk = get_chunk(chunk_position);
+	if (!chunk.sdf_generated)
+		return {};
+
+	return chunk.sdf0[l.x][l.y][l.z];
+}
+
+Optional<f32> sdf_at_interpolated(ChunkRelativePosition position) {
+	auto &chunk = get_chunk(position.chunk);
+	if (!chunk.sdf_generated)
+		return {};
+
+	auto l = floor_to_int(position.local);
+	auto t = position.local - (v3f)l;
+
+	f32 d[8];
+
+	if (all_true(l+1 < CHUNKW)) {
+		d[0b000] = chunk.sdf0[l.x+0][l.y+0][l.z+0];
+		d[0b001] = chunk.sdf0[l.x+0][l.y+0][l.z+1];
+		d[0b010] = chunk.sdf0[l.x+0][l.y+1][l.z+0];
+		d[0b011] = chunk.sdf0[l.x+0][l.y+1][l.z+1];
+		d[0b100] = chunk.sdf0[l.x+1][l.y+0][l.z+0];
+		d[0b101] = chunk.sdf0[l.x+1][l.y+0][l.z+1];
+		d[0b110] = chunk.sdf0[l.x+1][l.y+1][l.z+0];
+		d[0b111] = chunk.sdf0[l.x+1][l.y+1][l.z+1];
+	} else {
+		bool fail = false;
+		auto get = [&](v3f offset){auto s=sdf_at(position + offset);if(s)return s.value_unchecked();fail=true;return(s8)0;};
+		d[0b000] = get({0,0,0});
+		d[0b001] = get({0,0,1});
+		d[0b010] = get({0,1,0});
+		d[0b011] = get({0,1,1});
+		d[0b100] = get({1,0,0});
+		d[0b101] = get({1,0,1});
+		d[0b110] = get({1,1,0});
+		d[0b111] = get({1,1,1});
+		if (fail)
+			return {};
+	}
+	return
+		lerp(lerp(lerp(d[0b000],
+		               d[0b001], t.z),
+		          lerp(d[0b010],
+		               d[0b011], t.z), t.y),
+		     lerp(lerp(d[0b100],
+		               d[0b101], t.z),
+		          lerp(d[0b110],
+		               d[0b111], t.z), t.y), t.x);
+}
+
+Optional<v3f> gradient_at(ChunkRelativePosition position) {
+	auto &chunk = get_chunk(position.chunk);
+	if (!chunk.sdf_generated)
+		return {};
+
+	auto l = floor_to_int(position.local);
+
+	s8 d[8];
+
+	if (all_true(l+1 < CHUNKW)) {
+		d[0b000] = chunk.sdf0[l.x+0][l.y+0][l.z+0];
+		d[0b001] = chunk.sdf0[l.x+0][l.y+0][l.z+1];
+		d[0b010] = chunk.sdf0[l.x+0][l.y+1][l.z+0];
+		d[0b011] = chunk.sdf0[l.x+0][l.y+1][l.z+1];
+		d[0b100] = chunk.sdf0[l.x+1][l.y+0][l.z+0];
+		d[0b101] = chunk.sdf0[l.x+1][l.y+0][l.z+1];
+		d[0b110] = chunk.sdf0[l.x+1][l.y+1][l.z+0];
+		d[0b111] = chunk.sdf0[l.x+1][l.y+1][l.z+1];
+	} else {
+		bool fail = false;
+		auto get = [&](v3f offset){auto s=sdf_at(position + offset);if(s)return s.value_unchecked();fail=true;return(s8)0;};
+		d[0b000] = get({0,0,0});
+		d[0b001] = get({0,0,1});
+		d[0b010] = get({0,1,0});
+		d[0b011] = get({0,1,1});
+		d[0b100] = get({1,0,0});
+		d[0b101] = get({1,0,1});
+		d[0b110] = get({1,1,0});
+		d[0b111] = get({1,1,1});
+		if (fail)
+			return {};
+	}
+
+	auto v = (v3f)v3s{
+		d[0b000] - d[0b100] +
+		d[0b001] - d[0b101] +
+		d[0b010] - d[0b110] +
+		d[0b011] - d[0b111],
+		d[0b000] - d[0b010] +
+		d[0b001] - d[0b011] +
+		d[0b100] - d[0b110] +
+		d[0b101] - d[0b111],
+		d[0b000] - d[0b001] +
+		d[0b010] - d[0b011] +
+		d[0b100] - d[0b101] +
+		d[0b110] - d[0b111],
+	};
+
+	if (length(v) < 0.000001)
+		return {};
+
+	return normalize(v);
+}
+
 void update() {
+	// NOTE: all camera->position modifications must happen AFTER saving position at previous frame.
+	camera_chunk_last_frame = camera->position.chunk;
+
 	profile_frame = key_held('T');
 	if (profile_frame) {
 		profiler.reset();
@@ -1431,10 +1765,6 @@ void update() {
 			lock_cursor();
 	}
 
-	if (key_down('H')) {
-		camera_position = prev_camera_position = {0,1,0};
-	}
-
 	v3f camera_position_delta {
 		key_held(Key_d) - key_held(Key_a),
 		key_held(Key_e) - key_held(Key_q),
@@ -1443,65 +1773,158 @@ void update() {
 
 	camera_fov = clamp(camera_fov * powf(0.9f, mouse_wheel_delta), 1.f, 179.f);
 
-	target_camera_angles.y += mouse_delta.x * camera_fov * 0.00005f;
-	target_camera_angles.x += mouse_delta.y * camera_fov * 0.00005f;
+	target_camera_angles.y += mouse_delta.x * camera_fov * 0.00002f;
+	target_camera_angles.x += mouse_delta.y * camera_fov * 0.00002f;
 	camera_angles = lerp(camera_angles, target_camera_angles, V3f(frame_time * 20));
 
 	auto camera_rotation = m4::rotation_r_zxy(camera_angles);
 
-	switch (camera_mode) {
-		case CameraMode::fly: {
-			prev_camera_position = camera_position;
-			camera_position += camera_rotation * camera_position_delta * frame_time * 32 * (key_held(Key_shift) ? 10 : 1);
 
-			if (key_down('F')) {
-				camera_mode = CameraMode::walk;
-				prev_camera_position = camera_position;
-			}
-			break;
-		}
-		case CameraMode::walk: {
-			auto velocity = (camera_position - prev_camera_position).to_v3f();
-
-			//f32 const max_sideways_velocity = 8*frame_time;
-			//if (length(velocity.xz()) >= max_sideways_velocity) {
-			//	auto xz = normalize(velocity.xz()) * max_sideways_velocity;
-			//	velocity = {
-			//		xz.x,
-			//		velocity.y,
-			//		xz.y,
-			//	};
-			//}
-
-			prev_camera_position = camera_position;
-			camera_position += velocity * v3f{.9,1,.9} + v3f{0,-9.8f,0}*pow2(frame_time);
-
-			static v3f checkdir;
-
-			f32 camera_height = 1.75f;
-			if (auto collision = global_raycast(camera_position-v3f{0,camera_height,0}, (camera_position-prev_camera_position).to_v3f(), CHUNKW)) {
-				if (collision.distance < 1) {
-					checkdir = collision.normal;
-				}
-			}
-
-			if (auto collision = global_raycast(camera_position-v3f{0,camera_height,0}, checkdir, CHUNKW)) {
-				if (collision.distance < 2) {
-					camera_position = collision.position + v3f{0,camera_height,0};
-				}
-			}
-
-			camera_position += m4::rotation_r_y(camera_angles.y) * camera_position_delta * v3f{1,0,1} * frame_time * (key_held(Key_shift) ? 1 : 0.5f);
-
-			if (key_down('F')) {
-				camera_mode = CameraMode::fly;
-			}
-			break;
-		}
+	if (key_down('H')) {
+		camera->position = camera->prev_position = {0,1,0};
 	}
 
+	for (auto entity_it = entities.begin(); entity_it != entities.end();) {
+		auto &entity = *entity_it;
+		switch (entity.kind) {
+			case EntityKind::camera: {
+				switch (camera_mode) {
+					case CameraMode::fly: {
+						camera->prev_position = camera->position;
+						camera->position += camera_rotation * camera_position_delta * frame_time * 32 * (key_held(Key_shift) ? 10 : 1);
+
+						if (key_down('F')) {
+							camera_mode = CameraMode::walk;
+							camera->prev_position = camera->position;
+						}
+						break;
+					}
+					case CameraMode::walk: {
+						auto velocity = (camera->position - camera->prev_position).to_v3f();
+
+						//f32 const max_sideways_velocity = 8*frame_time;
+						//if (length(velocity.xz()) >= max_sideways_velocity) {
+						//	auto xz = normalize(velocity.xz()) * max_sideways_velocity;
+						//	velocity = {
+						//		xz.x,
+						//		velocity.y,
+						//		xz.y,
+						//	};
+						//}
+
+						camera->prev_position = camera->position;
+						if (length(camera_position_delta.xz()) < 0.001f)
+							camera->position += velocity*v3f{.0,1,.0} + v3f{0,-9.8f,0}*(2*pow2(frame_time));
+						else
+							camera->position += velocity*v3f{.8,1,.8} + v3f{0,-9.8f,0}*(2*pow2(frame_time));
+
+						static v3f checkdir;
+
+						f32 camera_height = 1.7f;
+						f32 player_height = 1.8f;
+						f32 player_radius = .2f;
+
+						v3f collision_points[] = {
+							{-player_radius,-camera_height             ,-player_radius},
+							{ player_radius,-camera_height             ,-player_radius},
+							{-player_radius,-camera_height             , player_radius},
+							{ player_radius,-camera_height             , player_radius},
+							{-player_radius,player_height-camera_height,-player_radius},
+							{ player_radius,player_height-camera_height,-player_radius},
+							{-player_radius,player_height-camera_height, player_radius},
+							{ player_radius,player_height-camera_height, player_radius},
+						};
+
+						bool fallback = false;
+						for (auto collision_point : collision_points) {
+							auto corner_pos = camera->position + collision_point;
+
+							s32 const iter_max = 1024;
+
+							s32 i = 0;
+							for (i = 0; i < iter_max; ++i) {
+								if (auto sdf_ = sdf_at_interpolated(corner_pos)) {
+									auto sdf = sdf_.value_unchecked();
+									if (sdf < 0) {
+										break;
+									}
+									if (auto gradient = gradient_at(corner_pos)) {
+										corner_pos += gradient.value_unchecked() / iter_max;
+									} else {
+										//corner_pos = camera->prev_position-v3f{0,camera_height,0};
+										corner_pos += v3f{0,frame_time,0};
+										fallback = true;
+									}
+
+									//if (auto collision = global_raycast(corner_pos, (camera->prev_position, camera->position).to_v3f(), CHUNKW)) {
+									//	camera->position = collision.position + v3f{0,camera_height,0};
+									//}
+								}
+							}
+							if (i == iter_max)
+								fallback = true;
+							camera->position = corner_pos - collision_point;
+						}
+
+						if (fallback)
+							camera->prev_position = camera->position;
+
+						camera->position += m4::rotation_r_y(camera_angles.y) * camera_position_delta * v3f{1,0,1} * frame_time * (key_held(Key_shift) ? 2 : 1);
+						if (key_down(' '))
+							camera->position += v3f{0,frame_time*10,0};
+
+						if (key_down('F')) {
+							camera_mode = CameraMode::fly;
+						}
+						break;
+					}
+				}
+				break;
+			}
+			case EntityKind::grenade: {
+				auto velocity = (entity.position - entity.prev_position).to_v3f();
+
+				entity.prev_position = entity.position;
+				entity.position += velocity*.99 + v3f{0,-9.8f,0}*pow2(frame_time);
+
+				static v3f checkdir;
+
+				if (auto collision = global_raycast(entity.position, (entity.position-entity.prev_position).to_v3f(), CHUNKW)) {
+					if (collision.distance < 1) {
+						checkdir = collision.normal;
+					}
+				}
+
+				if (auto collision = global_raycast(entity.position, checkdir, CHUNKW)) {
+					if (collision.distance < 2) {
+						entity.position = collision.position;
+					}
+				}
+
+				entity.grenade.timer -= frame_time;
+				if (entity.grenade.timer < 0) {
+					xorshift32 random { get_performance_counter() };
+
+					for (u32 i = 0; i < 8; ++i) {
+						add_sdf_sphere(entity.position + (next_v3f(random) * 8 - 4), map<f32>(next_f32(random), 0, 1, 4, 8), -256);
+					}
+
+					auto to_erase = entity_it;
+					++entity_it;
+					erase(entities, &*to_erase);
+
+					continue;
+				}
+
+				break;
+			}
+		}
+		++entity_it;
+	}
+
+
 	auto rotproj = m4::perspective_left_handed((f32)window_client_size.x / window_client_size.y, radians(camera_fov), 0.1, CHUNKW * DRAWD) * m4::rotation_r_yxz(-camera_angles);
-	auto camera_matrix = rotproj * m4::translation(-camera_position.local);
+	auto camera_matrix = rotproj * m4::translation(-camera->position.local);
 
 	frustum = create_frustum_planes_d3d(camera_matrix);
 
@@ -1511,68 +1934,29 @@ void update() {
 
 	generate_chunks_around();
 
+	auto camera_forward = camera_rotation * v3f{0,0,1};
+
 	if (mouse_held(0) || mouse_held(1)) {
-		if (auto hit = global_raycast(camera_position, camera_rotation * v3f{0,0,1}, CHUNKW)) {
-			timed_block(profiler, profile_frame, "apply deltas");
-
-			cursor_position = hit.position;
-
-			v3s center = round_to_int(hit.position.local);
-			s32 const radius = 4;
-
-			v3s cmin = hit.position.chunk + floor(center - radius-4, V3s(CHUNKW)) / CHUNKW;
-			v3s cmax = hit.position.chunk + ceil (center + radius+2, V3s(CHUNKW)) / CHUNKW;
-
-			auto add_sdf = [&](s32 x, s32 y, s32 z, s8 sdf) {
-				if (sdf == 0)
-					return;
-
-				v3s c = hit.position.chunk;
-				while (x < 0) { x += CHUNKW; c.x -= 1; }
-				while (y < 0) { y += CHUNKW; c.y -= 1; }
-				while (z < 0) { z += CHUNKW; c.z -= 1; }
-				while (x >= CHUNKW) { x -= CHUNKW; c.x += 1; }
-				while (y >= CHUNKW) { y -= CHUNKW; c.y += 1; }
-				while (z >= CHUNKW) { z -= CHUNKW; c.z += 1; }
-
-				auto &chunk = get_chunk(c);
-				chunk.sdf0[x][y][z] = clamp(chunk.sdf0[x][y][z] + sdf, -128, 127);
-			};
-
-			for (s32 x = -radius; x <= radius; ++x) {
-			for (s32 y = -radius; y <= radius; ++y) {
-			for (s32 z = -radius; z <= radius; ++z) {
-				auto c = center + v3s{x,y,z};
-				s8 d = (1 - min(radius, length(V3f(x,y,z))) / radius) * 8 * (mouse_held(0) ? 1 : -1);
-				add_sdf(c.x, c.y, c.z, d);
-			}
-			}
-			}
-
-			for (s32 x = cmin.x; x < cmax.x; ++x) {
-			for (s32 y = cmin.y; y < cmax.y; ++y) {
-			for (s32 z = cmin.z; z < cmax.z; ++z) {
-				auto &chunk = get_chunk(x,y,z);
-				filter_sdf(chunk);
-			}
-			}
-			}
-
-			auto work = make_work_queue(thread_pool);
-
-			for (s32 x = cmin.x; x < cmax.x; ++x) {
-			for (s32 y = cmin.y; y < cmax.y; ++y) {
-			for (s32 z = cmin.z; z < cmax.z; ++z) {
-				auto &chunk = get_chunk(x,y,z);
-				work.push([chunk = &chunk, chunk_position = v3s{x,y,z}] {
-					update_chunk_mesh(*chunk, chunk_position, chunk->lod_width);
-				});
-			}
-			}
-			}
-
-			work.wait_for_completion();
+		if (auto hit = global_raycast(camera->position, camera_forward, CHUNKW*2)) {
+			add_sdf_sphere(hit.position + camera_forward * (brush_size - 1.1) * (mouse_held(0) ? 1 : -1), brush_size, brush_size * 32 * (mouse_held(0) ? 1 : -1));
 		}
+	}
+
+	if (key_down('1')) {
+		if (brush_size != 1)
+			brush_size /= 2;
+	}
+	if (key_down('2')) {
+		if (brush_size != CHUNKW)
+			brush_size *= 2;
+	}
+
+	if (mouse_down(2)) {
+		auto &grenade = entities.add();
+		grenade.kind = EntityKind::grenade;
+		grenade.position = camera->position;
+		grenade.prev_position = camera->position - camera_forward * frame_time * 50;
+		grenade.grenade.timer = 3;
 	}
 
 	//if (key_down('G')) {
@@ -1595,7 +1979,6 @@ void update() {
 	//}
 
 
-	timed_block(profiler, profile_frame, "draw");
 
 	immediate_context->VSSetConstantBuffers(0, 1, &frame_cbuffer.cbuffer);
 	immediate_context->PSSetConstantBuffers(0, 1, &frame_cbuffer.cbuffer);
@@ -1605,82 +1988,88 @@ void update() {
 	//
 	// SHADOWS
 	//
-
-	//frame_cbuffer.update({
-	//	.mvp = camera_matrix,
-	//	.rotproj = rotproj,
-	//	.campos = camera_position.local,
-	//	.ldir = normalize(v3f{1,3,2}),
-	//});
-
-	v3f light_angles = {pi/4, pi/6, 0};
-
-	auto light_rotation = m4::rotation_r_zxy(light_angles);
-	v3f light_dir = light_rotation * v3f{0,0,-1};
-
-	f32 const shadow_pixels_in_meter = (f32)shadow_map_size / shadow_world_size / 2;
-
-	auto lightr = m4::rotation_r_yxz(-light_angles);
-
-	v3f lightpos = camera_position.local;
-	lightpos = lightr * lightpos;
-	lightpos *= shadow_pixels_in_meter;
-	lightpos = round(lightpos);
-	lightpos /= shadow_pixels_in_meter;
-	lightpos = inverse(lightr) * lightpos;
-
-	auto light_vp_matrix = m4::scale(1.f/shadow_world_size) * m4::rotation_r_yxz(-light_angles) * m4::translation(-lightpos);
-
-	frame_cbuffer.update({
-		//.mvp = m4::scale(.1f * v3f{(f32)window_client_size.x / window_client_size.y, 1, 1}) * m4::rotation_r_yxz(-v3f{pi}),
-		.mvp = m4::translation(0,0,.5) * m4::scale(1,1,.5) * light_vp_matrix,
-	});
-
 	{
-		D3D11_VIEWPORT viewport {
-			.TopLeftX = 0,
-			.TopLeftY = 0,
-			.Width = shadow_map_size,
-			.Height = shadow_map_size,
-			.MinDepth = 0,
-			.MaxDepth = 1,
-		};
-		immediate_context->RSSetViewports(1, &viewport);
-	}
+		timed_block(profiler, profile_frame, "shadows");
+		//frame_cbuffer.update({
+		//	.mvp = camera_matrix,
+		//	.rotproj = rotproj,
+		//	.campos = camera->position.local,
+		//	.ldir = normalize(v3f{1,3,2}),
+		//});
 
-	immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	immediate_context->VSSetShader(shadow_vs, 0, 0);
-	immediate_context->PSSetShader(shadow_ps, 0, 0);
-	immediate_context->RSSetState(0);
-	immediate_context->OMSetRenderTargets(1, &shadow_rtv, shadow_dsv);
-	immediate_context->OMSetBlendState(0, {}, -1);
-	immediate_context->ClearRenderTargetView(shadow_rtv, v4f{}.s);
-	immediate_context->ClearDepthStencilView(shadow_dsv, D3D11_CLEAR_DEPTH, 1, 0);
-	for_each(chunks_with_meshes, [&](Chunk *chunk) {
-		auto chunk_position = get_chunk_position(chunk);
-		if (chunk->vertex_buffer) {
-			auto relative_position = (v3f)((chunk_position-camera_position.chunk)*CHUNKW);
-			chunk_cbuffer.update({
-				.relative_position = relative_position,
-				.actual_position = (v3f)(chunk_position*CHUNKW),
-			});
+		v3f light_angles = {pi/4, pi/6, 0};
 
-			immediate_context->VSSetShaderResources(0, 1, &chunk->vertex_buffer);
-			immediate_context->Draw(chunk->vert_count, 0);
+		auto light_rotation = m4::rotation_r_zxy(light_angles);
+		v3f light_dir = light_rotation * v3f{0,0,-1};
+
+		f32 const shadow_pixels_in_meter = (f32)shadow_map_size / shadow_world_size / 2;
+
+		auto lightr = m4::rotation_r_yxz(-light_angles);
+
+		v3f lightpos = camera->position.local;
+		lightpos = lightr * lightpos;
+		lightpos *= shadow_pixels_in_meter;
+		lightpos = round(lightpos);
+		lightpos /= shadow_pixels_in_meter;
+		lightpos = inverse(lightr) * lightpos;
+
+		auto light_vp_matrix = m4::scale(1.f/shadow_world_size) * m4::rotation_r_yxz(-light_angles) * m4::translation(-lightpos);
+
+		frame_cbuffer.update({
+			//.mvp = m4::scale(.1f * v3f{(f32)window_client_size.x / window_client_size.y, 1, 1}) * m4::rotation_r_yxz(-v3f{pi}),
+			.mvp = m4::translation(0,0,.5) * m4::scale(1,1,.5) * light_vp_matrix,
+		});
+
+		{
+			D3D11_VIEWPORT viewport {
+				.TopLeftX = 0,
+				.TopLeftY = 0,
+				.Width = shadow_map_size,
+				.Height = shadow_map_size,
+				.MinDepth = 0,
+				.MaxDepth = 1,
+			};
+			immediate_context->RSSetViewports(1, &viewport);
 		}
-	});
+		immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		immediate_context->VSSetShader(shadow_vs, 0, 0);
+		immediate_context->PSSetShader(shadow_ps, 0, 0);
+		immediate_context->RSSetState(0);
+		immediate_context->OMSetRenderTargets(1, &shadow_rtv, shadow_dsv);
+		immediate_context->OMSetBlendState(0, {}, -1);
+		immediate_context->ClearRenderTargetView(shadow_rtv, v4f{}.s);
+		immediate_context->ClearDepthStencilView(shadow_dsv, D3D11_CLEAR_DEPTH, 1, 0);
+		for_each(chunks_with_meshes, [&](Chunk *chunk) {
+			auto chunk_position = get_chunk_position(chunk);
+			if (chunk->vertex_buffer) {
+				auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
+				chunk_cbuffer.update({
+					.relative_position = relative_position,
+					.actual_position = (v3f)(chunk_position*CHUNKW),
+				});
 
-	immediate_context->OMSetRenderTargets(0, 0, 0);
-	immediate_context->PSSetShaderResources(3, 1, &shadow_srv);
+				immediate_context->VSSetShaderResources(0, 1, &chunk->vertex_buffer);
+#if USE_INDICES
+				immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
+				immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
+#else
+				immediate_context->Draw(chunk->vert_count, 0);
+#endif
+			}
+		});
+
+		immediate_context->OMSetRenderTargets(0, 0, 0);
+		immediate_context->PSSetShaderResources(3, 1, &shadow_srv);
 
 
-	frame_cbuffer.update({
-		.mvp = camera_matrix,
-		.rotproj = rotproj,
-		.light_vp_matrix = light_vp_matrix,
-		.campos = camera_position.local,
-		.ldir = light_dir,
-	});
+		frame_cbuffer.update({
+			.mvp = camera_matrix,
+			.rotproj = rotproj,
+			.light_vp_matrix = light_vp_matrix,
+			.campos = camera->position.local,
+			.ldir = light_dir,
+		});
+	}
 
 	{
 		D3D11_VIEWPORT viewport {
@@ -1697,49 +2086,64 @@ void update() {
 	//
 	// SKY RENDER
 	//
-	immediate_context->VSSetShader(sky_vs, 0, 0);
-	immediate_context->PSSetShader(sky_ps, 0, 0);
-	immediate_context->OMSetRenderTargets(1, &sky_rt, 0);
-	immediate_context->Draw(36, 0);
+	{
+		timed_block(profiler, profile_frame, "sky render");
 
-	immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
-	immediate_context->ClearDepthStencilView(depth_stencil, D3D11_CLEAR_DEPTH, 1, 0);
+		immediate_context->VSSetShader(sky_vs, 0, 0);
+		immediate_context->PSSetShader(sky_ps, 0, 0);
+		immediate_context->OMSetRenderTargets(1, &sky_rt, 0);
+		immediate_context->Draw(36, 0);
 
-	immediate_context->PSSetShaderResources(1, 1, &sky_srv);
+		immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
+		immediate_context->ClearDepthStencilView(depth_stencil, D3D11_CLEAR_DEPTH, 1, 0);
 
+		immediate_context->PSSetShaderResources(1, 1, &sky_srv);
+	}
 
 	//
 	// SKY BLIT
 	//
-	immediate_context->VSSetShader(blit_vs, 0, 0);
-	immediate_context->PSSetShader(blit_ps, 0, 0);
-	immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
-	immediate_context->Draw(6, 0);
+	{
+		timed_block(profiler, profile_frame, "sky blit");
+		immediate_context->VSSetShader(blit_vs, 0, 0);
+		immediate_context->PSSetShader(blit_ps, 0, 0);
+		immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
+		immediate_context->Draw(6, 0);
+	}
 
 	//
 	// CHUNKS
 	//
-	immediate_context->OMSetRenderTargets(1, &back_buffer, depth_stencil);
-	immediate_context->VSSetShader(chunk_vs, 0, 0);
-	immediate_context->PSSetShader(chunk_solid_ps, 0, 0);
+	{
+		timed_block(profiler, profile_frame, "draw chunks");
+		immediate_context->OMSetRenderTargets(1, &back_buffer, depth_stencil);
+		immediate_context->VSSetShader(chunk_vs, 0, 0);
+		immediate_context->PSSetShader(chunk_solid_ps, 0, 0);
 
-	visible_chunks.clear();
+		visible_chunks.clear();
 
-	for (auto &chunk : flatten(chunks)) {
-		auto chunk_position = get_chunk_position(&chunk);
-		if (chunk.vertex_buffer) {
-			bool visible = chunk_in_view(chunk_position);
-			if (visible) {
-				visible_chunks.add({&chunk, chunk_position});
-				auto relative_position = (v3f)((chunk_position-camera_position.chunk)*CHUNKW);
-				chunk_cbuffer.update({
-					.relative_position = relative_position,
-					// .was_remeshed = (f32)(chunk.time_since_remesh < 0.1f),
-					.actual_position = (v3f)(chunk_position*CHUNKW),
-				});
+		for (auto &chunk : flatten(chunks)) {
+			auto chunk_position = get_chunk_position(&chunk);
+			if (chunk.vertex_buffer) {
+				timed_block(profiler, profile_frame, "draw chunk");
+				bool visible = chunk_in_view(chunk_position);
+				if (visible) {
+					visible_chunks.add({&chunk, chunk_position});
+					auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
+					chunk_cbuffer.update({
+						.relative_position = relative_position,
+						// .was_remeshed = (f32)(chunk.time_since_remesh < 0.1f),
+						.actual_position = (v3f)(chunk_position*CHUNKW),
+					});
 
-				immediate_context->VSSetShaderResources(0, 1, &chunk.vertex_buffer);
-				immediate_context->Draw(chunk.vert_count, 0);
+					immediate_context->VSSetShaderResources(0, 1, &chunk.vertex_buffer);
+#if USE_INDICES
+					immediate_context->IASetIndexBuffer(chunk.index_buffer, DXGI_FORMAT_R32_UINT, 0);
+					immediate_context->DrawIndexed(chunk.indices_count, 0, 0);
+#else
+					immediate_context->Draw(chunk.vert_count, 0);
+#endif
+				}
 			}
 		}
 	}
@@ -1754,27 +2158,139 @@ void update() {
 		for (auto chunk_and_position : visible_chunks) {
 			auto chunk = chunk_and_position.chunk;
 			auto chunk_position = chunk_and_position.position;
-			auto relative_position = (v3f)((chunk_position-camera_position.chunk)*CHUNKW);
+			auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
 			chunk_cbuffer.update({
 				.relative_position = relative_position,
 				.actual_position = (v3f)(chunk_position*CHUNKW),
 			});
 
 			immediate_context->VSSetShaderResources(0, 1, &chunk->vertex_buffer);
-			immediate_context->Draw(chunk->vert_count, 0);
+#if USE_INDICES
+				immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
+				immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
+#else
+				immediate_context->Draw(chunk->vert_count, 0);
+#endif
 		}
 	}
 
 	immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-
 	immediate_context->VSSetShader(cursor_vs, 0, 0);
 	immediate_context->PSSetShader(cursor_ps, 0, 0);
-	chunk_cbuffer.update({
-		.relative_position = cursor_position.local + (v3f)((cursor_position.chunk-camera_position.chunk)*CHUNKW),
-	});
-	immediate_context->Draw(6, 0);
 
-	swap_chain->Present(0, 0);
+	auto draw_cursor = [&](ChunkRelativePosition position) {
+		chunk_cbuffer.update({
+			.relative_position = position.local + (v3f)((position.chunk-camera->position.chunk)*CHUNKW),
+		});
+		immediate_context->Draw(6, 0);
+	};
+
+	draw_cursor(cursor_position);
+
+	for (auto &entity : entities) {
+		if (entity.kind == EntityKind::grenade) {
+			draw_cursor(entity.position);
+		}
+	}
+
+	immediate_context->RSSetState(0);
+	immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
+	immediate_context->VSSetShader(crosshair_vs, 0, 0);
+	immediate_context->PSSetShader(crosshair_ps, 0, 0);
+	immediate_context->Draw(4, 0);
+
+
+	{
+		timed_block(profiler, profile_frame, "ui");
+		StringBuilder builder;
+		append_format(builder, u8R"(fps: {}
+brush_size: {}
+camera->position: {}
+iter_from_center_offset_sdf: {}
+iter_from_center_offset_mesh: {}
+profile:
+)"s,
+smooth_fps,
+brush_size,
+camera->position,
+iter_from_center_offset_sdf,
+iter_from_center_offset_mesh
+);
+		HashMap<Span<utf8>, u64> time_spans;
+		for (auto &span : profiler.recorded_time_spans) {
+			time_spans.get_or_insert(span.name) += span.end - span.begin;
+		}
+		for_each(time_spans, [&] (auto name, auto duration) {
+			append_format(builder, "  {} {}us\n", name, duration * 1'000'000 / performance_frequency);
+		});
+
+		auto str = (Span<utf8>)to_string(builder);
+
+		auto font = get_font_at_size(font_collection, 24);
+		ensure_all_chars_present(str, font);
+		auto placed_chars = place_text(str, font);
+
+		if (font_vertex_buffer) {
+			font_vertex_buffer->Release();
+			font_vertex_buffer = 0;
+		}
+		{
+			List<FontVertex> vertices;
+			defer { free(vertices); };
+
+			for (auto c : placed_chars) {
+				FontVertex face[] {
+					{{c.position.min.x, c.position.min.y}, {c.uv.min.x, c.uv.min.y}},
+					{{c.position.min.x, c.position.max.y}, {c.uv.min.x, c.uv.max.y}},
+					{{c.position.max.x, c.position.min.y}, {c.uv.max.x, c.uv.min.y}},
+					{{c.position.max.x, c.position.max.y}, {c.uv.max.x, c.uv.max.y}},
+				};
+
+				vertices.add(face[0]);
+				vertices.add(face[2]);
+				vertices.add(face[1]);
+				vertices.add(face[1]);
+				vertices.add(face[2]);
+				vertices.add(face[3]);
+			}
+			for (auto &v : vertices) {
+				v.position = map(v.position, v2f{}, (v2f)window_client_size, v2f{-1, 1}, v2f{1,-1});
+			}
+
+			ID3D11Buffer *vertex_buffer;
+			defer { vertex_buffer->Release(); };
+			{
+				D3D11_BUFFER_DESC desc {
+					.ByteWidth = (UINT)(sizeof(FontVertex) * vertices.count),
+					.Usage = D3D11_USAGE_DEFAULT,
+					.BindFlags = D3D11_BIND_SHADER_RESOURCE,
+					.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+					.StructureByteStride = sizeof(vertices[0]),
+				};
+
+				D3D11_SUBRESOURCE_DATA init {
+					.pSysMem = vertices.data,
+				};
+
+				dhr(device->CreateBuffer(&desc, &init, &vertex_buffer));
+			}
+			{
+				dhr(device->CreateShaderResourceView(vertex_buffer, 0, &font_vertex_buffer));
+			}
+
+			immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			immediate_context->VSSetShaderResources(0, 1, &font_vertex_buffer);
+			immediate_context->PSSetShaderResources(0, 1, &font->texture);
+			immediate_context->VSSetShader(font_vs, 0, 0);
+			immediate_context->PSSetShader(font_ps, 0, 0);
+			immediate_context->OMSetBlendState(font_blend, {}, -1);
+
+			immediate_context->Draw(vertices.count, 0);
+		}
+	}
+
+
+	swap_chain->Present(1, 0);
 }
 void resize() {
 	if (swap_chain) {
@@ -1972,6 +2488,7 @@ SamplerComparisonState dsam : register(s1);
 Texture2D skytex : register(t1);
 Texture2D vorotex : register(t2);
 Texture2D shadowtex : register(t3);
+Texture2D normtex : register(t4);
 
 #define pow(t) \
 t pow2(t v){return v*v;} \
@@ -1991,6 +2508,12 @@ float sdot(float3 a, float3 b) {
 }
 
 float map(float value, float source_min, float source_max, float dest_min, float dest_max) {
+	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min;
+}
+float2 map(float2 value, float2 source_min, float2 source_max, float2 dest_min, float2 dest_max) {
+	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min;
+}
+float3 map(float3 value, float3 source_min, float3 source_max, float3 dest_min, float3 dest_max) {
 	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min;
 }
 float map_clamped(float value, float source_min, float source_max, float dest_min, float dest_max) {
@@ -2027,11 +2550,55 @@ float4 triplanar(Texture2D tex, SamplerState sam, float3 wpos, float3 normal) {
 	// t = pow(t, 16);
 	t *= 1.0f / (t.x + t.y + t.z);
 
-	pixel_color += tex.Sample(sam, wpos.yz) * t.x;
-	pixel_color += tex.Sample(sam, wpos.xz) * t.y;
-	pixel_color += tex.Sample(sam, wpos.xy) * t.z;
+	float2 u = wpos.zy * float2(+sign(normal.x), 1);
+	float2 v = wpos.xz * float2(+sign(normal.y), 1);
+	float2 w = wpos.xy * float2(-sign(normal.z), 1);
+
+	pixel_color += tex.Sample(sam, u) * t.x;
+	pixel_color += tex.Sample(sam, v) * t.y;
+	pixel_color += tex.Sample(sam, w) * t.z;
 
 	return pixel_color;
+}
+
+float3 calculate_normal(float3 normal, float3 tangent, float3 tangent_space_normal)
+{
+   tangent_space_normal.xy *= -1;
+   float3 bitangent = cross(normal, tangent);
+   return normalize(
+      tangent_space_normal.x * tangent +
+      tangent_space_normal.y * bitangent +
+      tangent_space_normal.z * normal
+   );
+}
+float3 unpack_normal(float3 color, float scale) {
+	return normalize(map(
+		color,
+		0,
+		1,
+		float3(-scale,-scale,0),
+		float3(+scale,+scale,1)
+	));
+}
+
+// I tried to make an overcomplicated mess as always and it didn't work.
+// So i'm using an algorithm described in here:
+// https://bgolus.medium.com/normal-mapping-for-a-triplanar-shader-10bf39dca05a
+// They are also describing different blending techniques, but i think this is already good enough.
+float3 triplanar_normal(Texture2D tex, SamplerState sam, float3 wpos, float3 normal) {
+	float3 t = abs(normal);
+	// t = pow(t, 16);
+	t *= 1.0f / (t.x + t.y + t.z);
+
+	float normal_scale = .5;
+	float3 nx = unpack_normal(tex.Sample(sam, wpos.zy).rgb, normal_scale);
+	float3 ny = unpack_normal(tex.Sample(sam, wpos.xz).rgb, normal_scale);
+	float3 nz = unpack_normal(tex.Sample(sam, wpos.xy).rgb, normal_scale);
+	nx.z *= sign(normal).x;
+	ny.z *= sign(normal).y;
+	nz.z *= sign(normal).z;
+
+	return normalize(nx.zyx * t.x + ny.xzy * t.y + nz.xyz * t.z);
 }
 
 void main(
@@ -2044,8 +2611,11 @@ void main(
 
 	out float4 pixel_color : SV_Target
 ) {
+	normal = normalize(normal);
+
 	float3 L = c_ldir;
-	float3 N = normalize(normal);
+	float3 N = float4(triplanar_normal(normtex, sam, wpos, normal), 1);
+
 	float3 V = -normalize(view);
 	float3 H = normalize(V + L);
 
@@ -2054,8 +2624,9 @@ void main(
 	float NH = max(dot(N, H), 1e-3f);
 	float VH = max(dot(V, H), 1e-3f);
 
-	float trip = triplanar(vorotex, sam, wpos, normal);
-	trip = map(trip, 0.1, 0.4, 0, 1);
+	float4 trip = triplanar(vorotex, sam, wpos, normal);
+	//pixel_color = N.xyzz;
+	//return;
 
 	float3 grass = lerp(float3(.0,.1,.0), float3(.6,.9,.3), trip);
 	float3 rock  = float3(.2,.2,.1) * trip;
@@ -2066,7 +2637,7 @@ void main(
 	float3 albedo = lerp(rock, grass, gr) * color_;
 
 	float metalness = 0;
-	float roughness = 1;
+	float roughness = .5;
 
 	screen_uv = (screen_uv / screen_uv.w) * 0.5 + 0.5;
 	float3 ambient_color = skytex.Sample(sam, screen_uv.xy);
@@ -2090,7 +2661,7 @@ void main(
 	float shadow_mask = saturate(map(length(shadow_map_uv.xyz), 0.9, 1, 0, 1));
 	shadow_map_uv = shadow_map_uv * 0.5 + 0.5;
 
-	float lightness = lerp(shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01).x, 1, shadow_mask);
+	float lightness = lerp(shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.003).x, 1, shadow_mask);
 	pixel_color.rgb = ambient + (diffuse + specular) * lightness;
 	pixel_color.a = 1;
 
@@ -2289,6 +2860,47 @@ void main(
 }
 )"s);
 
+			font_vs = create_vs(R"(
+struct Vertex {
+	float2 position;
+	float2 uv;
+};
+
+StructuredBuffer<Vertex> vertices : register(t0);
+
+void main(in uint vertex_id : SV_VertexID, out float2 uv : UV, out float4 position : SV_Position) {
+	Vertex v = vertices[vertex_id];
+	position = float4(v.position, 0, 1);
+	uv = v.uv;
+}
+)"s);
+			font_ps = create_ps(R"(
+SamplerState sam : register(s0);
+Texture2D tex : register(t0);
+void main(in float2 uv : UV, out float4 pixel_color0 : SV_Target, out float4 pixel_color1 : SV_Target1) {
+	pixel_color0 = 1;
+	pixel_color1 = float4(tex.Sample(sam, uv).rgb, 1);
+}
+)"s);
+
+			crosshair_vs = create_vs(R"(
+void main(in uint vertex_id : SV_VertexID, out float4 position : SV_Position) {
+	float size = .01;
+	float2 positions[] = {
+		{-size, 0},
+		{ size, 0},
+		{ 0,-size},
+		{ 0, size},
+	};
+
+	position = float4(positions[vertex_id], 0, 1);
+}
+)"s);
+			crosshair_ps = create_ps(R"(
+void main(out float4 pixel_color : SV_Target) {
+	pixel_color = 1;
+}
+)"s);
 
 			frame_cbuffer.init();
 			chunk_cbuffer.init();
@@ -2309,6 +2921,23 @@ void main(
 					}
 				};
 				dhr(device->CreateBlendState(&desc, &alpha_blend));
+			}
+			{
+				D3D11_BLEND_DESC desc {
+					.RenderTarget = {
+						{
+							.BlendEnable = true,
+							.SrcBlend  = D3D11_BLEND_SRC1_COLOR,
+							.DestBlend = D3D11_BLEND_INV_SRC1_COLOR,
+							.BlendOp   = D3D11_BLEND_OP_ADD,
+							.SrcBlendAlpha  = D3D11_BLEND_ZERO,
+							.DestBlendAlpha = D3D11_BLEND_ZERO,
+							.BlendOpAlpha   = D3D11_BLEND_OP_ADD,
+							.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL,
+						}
+					}
+				};
+				dhr(device->CreateBlendState(&desc, &font_blend));
 			}
 			{
 				D3D11_RASTERIZER_DESC desc {
@@ -2357,6 +2986,9 @@ void main(
 				v4u8 pixels[256][256]{};
 				for (s32 x = 0; x < 256; ++x) {
 				for (s32 y = 0; y < 256; ++y) {
+#if 0
+					pixels[x][y] = (v4u8)V4f(255*pow2(1-length(V2f(x,y)-128)/(sqrtf(128*128*2))));
+#else
 					s32 step_size = 4;
 					for (s32 i = 0; i < 4; ++i) {
 						v2s coordinate = {x,y};
@@ -2379,31 +3011,58 @@ void main(
 
 						step_size *= 2;
 					}
+					pixels[x][y] = (v4u8)V4f(map_clamped<f32>(pixels[x][y].x/255.f, 0.1, 0.4, 0, 1)*255.f);
+#endif
 				}
 				}
-
-				D3D11_TEXTURE2D_DESC desc {
-					.Width = 256,
-					.Height = 256,
-					.MipLevels = 1,
-					.ArraySize = 1,
-					.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
-					.SampleDesc = {1,0},
-					.BindFlags = D3D11_BIND_SHADER_RESOURCE,
-				};
-
-				D3D11_SUBRESOURCE_DATA data {
-					.pSysMem = pixels,
-					.SysMemPitch = 256*sizeof(v4u8),
-				};
-
-				ID3D11Texture2D *texture;
-				dhr(device->CreateTexture2D(&desc, &data, &texture));
-
-				ID3D11ShaderResourceView *grass_texture;
-				dhr(device->CreateShaderResourceView(texture, 0, &grass_texture));
-
+				auto grass_texture = make_texture(pixels);
 				immediate_context->PSSetShaderResources(2, 1, &grass_texture);
+
+				v2f normalf[256][256]{};
+				for (s32 x = 0; x < 256; ++x) {
+				for (s32 y = 0; y < 256; ++y) {
+					normalf[x][y] += V2f(
+						 pixels[x][y        ].x - pixels[(x+1)%256][y        ].x +
+						 pixels[x][(y+1)%256].x - pixels[(x+1)%256][(y+1)%256].x,
+						 pixels[x        ][y].x - pixels[x        ][(y+1)%256].x +
+						 pixels[(x+1)%256][y].x - pixels[(x+1)%256][(y+1)%256].x
+					);
+				}
+				}
+
+				v4u8 normal[256][256]{};
+				for (s32 x = 0; x < 256; ++x) {
+				for (s32 y = 0; y < 256; ++y) {
+					auto &n = normal[y][x];
+#if 0
+					if (sqrtf(pow2(x-128)+pow2(y-128)) < 128) {
+						n = {(u8)x,(u8)y,0,255};
+					} else {
+						n = {128,128,0,255};
+					}
+
+					n.z = (u8)map<f32>(1 - sqrtf(pow2(map<f32>(n.x, 0, 255, -1, 1)) + pow2(map<f32>(n.y, 0, 255, -1, 1))), 0, 1, 0, 255);
+					n = {(u8)x,(u8)y,0,255};
+
+					//normal[x][y] = {(u8)x,(u8)y,0,1};
+#else
+					if (length(normalf[y][x]) < 0.000001f) {
+						normal[y][x] = {0,0,255,255};
+					} else {
+						auto nf = normalize(normalf[y][x]);
+						normal[y][x] = (v4u8)map(V4f(
+							nf.x,
+							nf.y,
+							sqrtf(nf.x*nf.x + nf.y*nf.y),
+							1
+						), V4f(-1,-1,0,0), V4f(1), V4f(0), V4f(255));
+					}
+#endif
+				}
+				}
+
+				auto normal_texture = make_texture(normal);
+				immediate_context->PSSetShaderResources(4, 1, &normal_texture);
 			}
 			{
 				ID3D11Texture2D *tex;
@@ -2510,23 +3169,59 @@ auto on_key_up = [](u8 key) {
 	key_state[key] = KeyState_up;
 };
 auto on_mouse_down = [](u8 button){
+	lock_cursor();
 	key_state[256 + button] = KeyState_down | KeyState_held;
 };
 auto on_mouse_up = [](u8 button){
 	key_state[256 + button] = KeyState_up;
 };
 
+List<utf8> executable_path;
+Span<utf8> executable_directory;
+
+template <class Write>
+void encode_int32_multibyte(u32 x, Write &&write) requires requires { write((u8)0); } {
+	while (x >= 0x80) {
+		write((u8)((x & 0x7F) | 0x80));
+		x >>= 7;
+	}
+	write((u8)x);
+}
+
+template <class Read>
+u32 decode_int32_multibyte(Read &&read) requires requires { (u8)read(); } {
+	u32 v = 0;
+	u32 i = 0;
+	u8 p;
+	do {
+		p = read();
+		v |= (p & 0x7f) << i;
+		i += 7;
+	} while (p & 0x80);
+	return v;
+}
+
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 	init_allocator();
+
+	executable_path = get_executable_path();
+	executable_directory = parse_path(executable_path).directory;
 
 	_chunks = (decltype(_chunks))VirtualAlloc(0, sizeof(Chunk) * pow3(DRAWD*2+1), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
 	for (auto &chunk : flatten(chunks)) {
 		construct(chunk.vertices);
+#if USE_INDICES
+		construct(chunk.indices);
+#endif
 	}
+
 	construct(profiler);
 	construct(thread_pool);
 	construct(chunks_with_meshes);
 	construct(visible_chunks);
+	construct(entities);
+	construct(saved_chunks);
 	thread_count = get_cpu_info().logical_processor_count;
 	init_thread_pool(thread_pool, thread_count);
 	//init_thread_pool(thread_pool, 0);
@@ -2536,7 +3231,142 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
 	init_printer();
 
-	make_os_timing_precise();
+	auto save_path = format(u8"{}/world.save", executable_directory);
+
+	{
+		auto file = open_file(save_path, {.read=true});
+		if (is_valid(file)) {
+			defer { close(file); };
+
+			auto map = map_file(file);
+			defer { unmap_file(map); };
+
+			auto chunk_count = *(u32 *)map.data.data;
+
+			auto positions = (v3s *)(map.data.data + sizeof(u32));
+
+			auto cursor    = (u8 *)(positions + chunk_count);
+
+#define read(name, type) \
+	if (cursor + sizeof(type) > map.data.end()) { \
+		with(ConsoleColor::red, print("Failed to load save file: too little data\n")); \
+		saved_chunks.clear(); \
+		goto skip_load; \
+	} \
+	auto name = *(type *)cursor; \
+	cursor += sizeof(type);
+
+#define reade(name, type) \
+	if (cursor + sizeof(type) > map.data.end()) { \
+		with(ConsoleColor::red, print("Failed to load save file: too little data\n")); \
+		saved_chunks.clear(); \
+		goto skip_load; \
+	} \
+	name = *(type *)cursor; \
+	cursor += sizeof(type);
+
+			for (u32 chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+				auto &saved = saved_chunks.get_or_insert(positions[chunk_index]);
+				u32 offset = 0;
+				while (offset < CHUNKW*CHUNKW*CHUNKW) {
+					u32 count = 0;
+
+					u32 i = 0;
+					u8 count_part;
+					do {
+						reade(count_part, u8);
+						count |= (u32)(count_part & 0x7F) << i;
+						i += 7;
+					} while (count_part & 0x80);
+
+					if (offset+count > CHUNKW*CHUNKW*CHUNKW) {
+						with(ConsoleColor::red, print("Failed to load save file: chunk size corrupt\n"));
+						saved_chunks.clear();
+						goto skip_load;
+					}
+
+					read(sdf, u8);
+
+					memset((s8 *)saved.sdf + offset, sdf, count);
+					offset += count;
+				}
+				if (offset != CHUNKW*CHUNKW*CHUNKW) {
+					with(ConsoleColor::red, print("Failed to load save file: chunk size in file is wrong\n"));
+					saved_chunks.clear();
+					goto skip_load;
+				}
+			}
+		}
+	}
+skip_load:
+
+	defer {
+		profiler.reset();
+		defer { write_entire_file("save.tmd"s, as_bytes(profiler.output_for_timed())); };
+
+		timed_block(profiler, true, "save");
+		{
+			timed_block(profiler, true, "write modified chunks");
+			for (auto &chunk : flatten(chunks)) {
+				if (chunk.was_modified) {
+					save_chunk(chunk, get_chunk_position(&chunk));
+				}
+			}
+		}
+
+		u32 fail_count = 0;
+		u32 const max_fail_count = 4;
+
+		auto tmp_path = format(u8"{}.tmp", save_path);
+
+		StringBuilder builder;
+		auto write = [&](auto value) {
+			append(builder, value_as_bytes(value));
+		};
+
+		write((u32)saved_chunks.total_value_count);
+
+		for (auto &[position, saved] : saved_chunks) {
+			write((v3s)position);
+		}
+		for (auto &[position, saved] : saved_chunks) {
+			timed_block(profiler, true, "write chunk");
+
+			auto sdf = flatten(saved.sdf);
+			u32 first_index = 0;
+			while (first_index < CHUNKW*CHUNKW*CHUNKW) {
+				auto first = sdf[first_index];
+				u32 end_index = first_index + 1;
+				for (; end_index < sdf.count; ++end_index) {
+					if (sdf[end_index] == first) {
+						continue;
+					} else {
+						break;
+					}
+				}
+
+				auto count = end_index - first_index;
+
+				//encode_int32_multibyte(count, [&](u8 b){write(b);});
+				{
+					auto x = count;
+					while (x >= 0x80) {
+						write((u8)((x & 0x7F) | 0x80));
+						x >>= 7;
+					}
+					write((u8)x);
+				}
+
+				write((s8)first);
+
+				first_index += count;
+			}
+			assert(first_index == CHUNKW*CHUNKW*CHUNKW);
+		}
+
+		timed_block(profiler, true, "write file");
+		write_entire_file(save_path, as_bytes(to_string(builder)));
+	};
 
     WNDCLASSEXW c = {
         .cbSize = sizeof WNDCLASSEXW,
@@ -2555,7 +3385,55 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
     assert_always(hwnd);
 
-	prev_camera_position = camera_position;
+	font_collection = create_font_collection(as_span({
+		(Span<utf8>)format(u8"{}\\segoeui.ttf"s, executable_directory),
+	}));
+	font_collection->update_atlas = [](TL_FONT_TEXTURE_HANDLE texture, void *data, v2u size) -> TL_FONT_TEXTURE_HANDLE {
+		ID3D11Texture2D *buffer;
+		defer { buffer->Release(); };
+
+		List<v4u8> fourcomp;
+		defer { free(fourcomp); };
+
+		fourcomp.reserve(size.x*size.y);
+
+		for (umm i = 0; i < size.x*size.y; ++i) {
+			fourcomp.add((v4u8)V4u((v3u)((v3u8 *)data)[i], 0));
+		}
+
+		u32 pitch = sizeof(v4u8) * size.x;
+
+		if (texture) {
+			texture->GetResource((ID3D11Resource **)&buffer);
+
+			immediate_context->UpdateSubresource(buffer, 0, 0, fourcomp.data, pitch, 1);
+		} else {
+
+			{
+				D3D11_TEXTURE2D_DESC desc {
+					.Width = size.x,
+					.Height = size.y,
+					.MipLevels = 1,
+					.ArraySize = 1,
+					.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+					.SampleDesc = {1, 0},
+					.BindFlags = D3D11_BIND_SHADER_RESOURCE,
+				};
+
+				D3D11_SUBRESOURCE_DATA init {
+					.pSysMem = fourcomp.data,
+					.SysMemPitch = pitch,
+				};
+
+				dhr(device->CreateTexture2D(&desc, &init, &buffer));
+			}
+			dhr(device->CreateShaderResourceView(buffer, 0, &texture));
+		}
+		return texture;
+	};
+
+	camera = &entities.add();
+	camera->prev_position = camera->position = {0,1,0};
 
 
 	start();
@@ -2564,8 +3442,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
 	lock_cursor();
 
+	make_os_timing_precise();
 	auto frame_time_counter = get_performance_counter();
 	auto actual_frame_timer = create_precise_timer();
+	auto stat_reset_timer = get_performance_counter();
 
     while (1) {
 		MSG message;
@@ -2660,8 +3540,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
 		sync(frame_time_counter, frame_time);
 
-		//print("{}\n", reset(actual_frame_timer)*1000);
-		print("{}\n", iter_from_center_offset_mesh);
+		//if (get_performance_counter() >= stat_reset_timer + performance_frequency) {
+		//	stat_reset_timer = get_performance_counter();
+		//	actual_fps.reset();
+		//}
+
+		// actual_fps.set(1.0f / reset(actual_frame_timer));
+		//print("{}\n", *1000);
+		//print("{}\n", iter_from_center_offset_mesh);
+
+		smooth_fps = lerp(smooth_fps, 1.0f / (f32)reset(actual_frame_timer), 0.25f);
 	}
 
     return 0;

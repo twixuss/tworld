@@ -88,25 +88,29 @@
     <LinkIncremental>true</LinkIncremental>
     <OutDir>$(SolutionDir)bin\</OutDir>
     <IntDir>$(SolutionDir)temp\</IntDir>
-    <IncludePath>$(SolutionDir)dep/tl/include;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)dep/tl/include;$(SolutionDir)dep/freetype/include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)dep/freetype/win64;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LinkIncremental>false</LinkIncremental>
     <OutDir>$(SolutionDir)bin\</OutDir>
     <IntDir>$(SolutionDir)temp\</IntDir>
-    <IncludePath>$(SolutionDir)dep/tl/include;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)dep/tl/include;$(SolutionDir)dep/freetype/include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)dep/freetype/win64;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
     <OutDir>$(SolutionDir)bin\</OutDir>
     <IntDir>$(SolutionDir)temp\</IntDir>
-    <IncludePath>$(SolutionDir)dep/tl/include;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)dep/tl/include;$(SolutionDir)dep/freetype/include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)dep/freetype/win64;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
     <OutDir>$(SolutionDir)bin\</OutDir>
     <IntDir>$(SolutionDir)temp\</IntDir>
-    <IncludePath>$(SolutionDir)dep/tl/include;$(IncludePath)</IncludePath>
+    <IncludePath>$(SolutionDir)dep/tl/include;$(SolutionDir)dep/freetype/include;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)dep/freetype/win64;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
