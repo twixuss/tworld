@@ -1,3 +1,7 @@
+// TODO:
+// fix gaps at the edge of draw distance.
+// For some reason chunks that become on the edge remesh when they don't have to.
+
 #define _CRT_SECURE_NO_WARNINGS
 #define TL_IMPL
 #define TL_DEBUG 1
@@ -157,18 +161,11 @@ CBuffer<ChunkCbuffer> chunk_cbuffer;
 Profiler profiler;
 bool profile_frame;
 
+f32 frame_time;
+f32 update_time;
+f32 generate_time;
 
 ThreadPool thread_pool;
-
-namespace neighbor {
-u32 const x = 0;
-u32 const y = 1;
-u32 const z = 2;
-u32 const yz = 3;
-u32 const xz = 4;
-u32 const xy = 5;
-u32 const xyz = 6;
-}
 
 struct ChunkRelativePosition {
 	v3s chunk;
@@ -252,23 +249,32 @@ struct NeighborMask {
 	auto operator<=>(NeighborMask const &) const = default;
 };
 
+struct Vertex {
+	v3f position;
+	v3f normal;
+};
+
+struct VertexBuffer {
+	ID3D11ShaderResourceView *view = 0;
+	u32 vertex_count = 0;
+};
+
 struct Chunk {
-	ID3D11ShaderResourceView *vertex_buffer = 0;
+	VertexBuffer vertex_buffers[6] = {};
 #if USE_INDICES
 	ID3D11Buffer *index_buffer = 0;
 #endif
-	List<v3f> vertices;
+	List<v3f> positions;
 #if USE_INDICES
 	List<u32> indices;
 	u32 indices_count = 0;
 #else
-	u32 vert_count = 0;
 #endif
-	u32 lod_width = 1;
 	f32 time_since_remesh = 0;
 	Mutex mutex;
 	NeighborMask neighbor_mask = {};
 	bool sdf_generated = false;
+	bool mesh_generated = false;
 	bool was_modified = false;
 #if 0
 	Array<Array<Array<s8, CHUNKW>, CHUNKW>, CHUNKW> sdf;
@@ -353,21 +359,23 @@ NeighborMask get_neighbor_mask(v3s position) {
 	auto _110 = get_chunk(position + v3s{1,1,0}).sdf_generated;
 	auto _111 = get_chunk(position + v3s{1,1,1}).sdf_generated;
 
+	auto r = position != camera->position.chunk + DRAWD;
+
 	NeighborMask mask;
 	mask.x =
-		(position - camera->position.chunk).x != DRAWD &&
+		r.x &&
 		_100 &&
 		_110 &&
 		_101 &&
 		_111;
 	mask.y =
-		(position - camera->position.chunk).y != DRAWD &&
+		r.y &&
 		_010 &&
 		_110 &&
 		_011 &&
 		_111;
 	mask.z =
-		(position - camera->position.chunk).z != DRAWD &&
+		r.z &&
 		_001 &&
 		_101 &&
 		_011 &&
@@ -401,124 +409,17 @@ void save_chunk(Chunk &chunk, v3s chunk_position) {
 	auto &saved = saved_chunks.get_or_insert(chunk_position);
 	memcpy(saved.sdf, chunk.sdf0, sizeof(chunk.sdf0));
 }
-struct Vertex {
-	v3f position;
-	v3f normal;
-	u32 parent_vertex;
-};
-
-#if 0
-
-	f32 sdf[lodw+2][lodw+2][lodw+2]{};
-#if 0
-	if constexpr (true) {//(false && lodw == 16) {
-		timed_block(profiler, profile_frame, "sdf generation");
-		for (s32 x = 0; x < lodw+2; ++x) {
-		for (s32 y = 0; y < lodw+2; ++y) {
-		for (s32 z = 0; z < lodw+2; ++z) {
-			f32 d = 0;
-
-			v3s gg = v3s{x,y,z}*CHUNKW/lodw + chunk.position * CHUNKW;
 
 
-			for (s32 ox = 0; ox < (1<<(log2(CHUNKW)-log2(lodw))); ++ox) {
-			for (s32 oy = 0; oy < (1<<(log2(CHUNKW)-log2(lodw))); ++oy) {
-			for (s32 oz = 0; oz < (1<<(log2(CHUNKW)-log2(lodw))); ++oz) {
-				v3s g = gg + v3s{ox,oy,oz};
-
-				s32 scale = 1;
-				for (s32 i = 0; i < 4; ++i) {
-					d += (value_noise_v3s_smooth({
-						(s32)(g.x + 0xa133b78c),
-						(s32)(g.y + 0x2d462e4f),
-						(s32)(g.z + 0x9f83e86d)
-					}, CHUNKW*scale/4) - 0.5f + (CHUNKW/2 - g.y) * 0.00125f) * scale;
-					scale *= 2;
-				}
-			}
-			}
-			}
-
-			if (-0.01f <= d && d <= 0.01f) {
-				d = 0.01f;
-			}
-
-			sdf[x][y][z] = d;
-		}
-		}
-		}
-	} // else
-#else
-	{
-		timed_block(profiler, profile_frame, "sdf generation");
-#if 0
-		for (s32 x = 0; x < (lodw+2) * (1<<(log2(CHUNKW)-log2(lodw))); ++x) {
-		for (s32 y = 0; y < (lodw+2) * (1<<(log2(CHUNKW)-log2(lodw))); ++y) {
-		for (s32 z = 0; z < (lodw+2) * (1<<(log2(CHUNKW)-log2(lodw))); ++z) {
-			f32 d = 0;
-
-			v3s g = v3s{x,y,z} + chunk.position * CHUNKW;
-
-			s32 scale = 1;
-			for (s32 i = 0; i < 4; ++i) {
-				d += (value_noise_v3s_smooth({
-					(s32)(g.x + 0xa133b78c),
-					(s32)(g.y + 0x2d462e4f),
-					(s32)(g.z + 0x9f83e86d)
-				}, CHUNKW*scale/4) - 0.5f + (CHUNKW/2 - g.y) * 0.00125f) * scale;
-				scale *= 2;
-			}
-
-			if (-0.01f <= d && d <= 0.01f) {
-				d = 0.01f;
-			}
-
-			sdf[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += d;
-		}
-		}
-		}
-#else
-		for (s32 x = 0; x < lodw+2; ++x) {
-		for (s32 y = 0; y < lodw+2; ++y) {
-		for (s32 z = 0; z < lodw+2; ++z) {
-			f32 d = 0;
-
-			v3s g = v3s{x,y,z} + chunk.position * CHUNKW;
-
-			s32 scale = 1;
-			for (s32 i = 0; i < 4; ++i) {
-				d += (value_noise_v3s_smooth({
-					(s32)(g.x + 0xa133b78c),
-					(s32)(g.y + 0x2d462e4f),
-					(s32)(g.z + 0x9f83e86d)
-				}, CHUNKW*scale/4) - 0.5f + (CHUNKW/2 - g.y) * 0.00125f) * scale;
-				scale *= 2;
-			}
-
-			d *= 1000;
-
-			if (-0.01f <= d && d <= 0.01f) {
-				d = 0.01f;
-			}
-
-			sdf[x][y][z] += d;
-		}
-		}
-		}
-#endif
-	}
-#endif
-
-#endif
-
-u64 total_time_wasted_on_generating_sdfs;
-u64 total_sdfs_generated;
+// NOTE: in seconds
+f32 smoothed_average_generation_time;
+u64 sdfs_generated_per_frame;
 
 s32x8 randomize(s32x8 v) {
 	v = vec32_xor(v, s32x8_set1(0x55555555u));
 	v = s32x8_mul(v, s32x8_set1(u32_random_primes[0]));
-	v = vec32_xor(v, s32x8_set1(0x33333333u));
-	v = s32x8_mul(v, s32x8_set1(u32_random_primes[1]));
+	// v = vec32_xor(v, s32x8_set1(0x33333333u));
+	// v = s32x8_mul(v, s32x8_set1(u32_random_primes[1]));
 	return v;
 }
 
@@ -561,31 +462,29 @@ void filter_sdf(Chunk &chunk) {
 
 void generate_sdf(Chunk &chunk, v3s chunk_position) {
 	timed_function(profiler, profile_frame);
-	auto start_time = get_performance_counter();
 
 	defer {
 		chunk.sdf_generated = true;
-		atomic_add(&total_time_wasted_on_generating_sdfs, get_performance_counter() - start_time);
-		atomic_increment(&total_sdfs_generated);
+		atomic_increment(&sdfs_generated_per_frame);
 	};
 
-	if (chunk_position.y > 4) {
-		memset(chunk.sdf0, 0, sizeof chunk.sdf0);
-		memset(chunk.sdf1, 0, sizeof chunk.sdf1);
-		memset(chunk.sdf2, 0, sizeof chunk.sdf2);
-		memset(chunk.sdf3, 0, sizeof chunk.sdf3);
-		memset(chunk.sdf4, 0, sizeof chunk.sdf4);
-		memset(chunk.sdf5, 0, sizeof chunk.sdf5);
+	if (chunk_position.y > 8) {
+		memset(chunk.sdf0, -128, sizeof chunk.sdf0);
+		memset(chunk.sdf1, -128, sizeof chunk.sdf1);
+		memset(chunk.sdf2, -128, sizeof chunk.sdf2);
+		memset(chunk.sdf3, -128, sizeof chunk.sdf3);
+		memset(chunk.sdf4, -128, sizeof chunk.sdf4);
+		memset(chunk.sdf5, -128, sizeof chunk.sdf5);
 		return;
 	}
 
-	if (chunk_position.y < -4) {
-		memset(chunk.sdf0, 255, sizeof chunk.sdf0);
-		memset(chunk.sdf1, 255, sizeof chunk.sdf1);
-		memset(chunk.sdf2, 255, sizeof chunk.sdf2);
-		memset(chunk.sdf3, 255, sizeof chunk.sdf3);
-		memset(chunk.sdf4, 255, sizeof chunk.sdf4);
-		memset(chunk.sdf5, 255, sizeof chunk.sdf5);
+	if (chunk_position.y < -8) {
+		memset(chunk.sdf0, 127, sizeof chunk.sdf0);
+		memset(chunk.sdf1, 127, sizeof chunk.sdf1);
+		memset(chunk.sdf2, 127, sizeof chunk.sdf2);
+		memset(chunk.sdf3, 127, sizeof chunk.sdf3);
+		memset(chunk.sdf4, 127, sizeof chunk.sdf4);
+		memset(chunk.sdf5, 127, sizeof chunk.sdf5);
 		return;
 	}
 
@@ -599,7 +498,7 @@ void generate_sdf(Chunk &chunk, v3s chunk_position) {
 	for (s32 z = 0; z < CHUNKW; z += 8) {
 		f32x8 d = {};
 		s32 scale = 1;
-		for (s32 i = 0; i < 8; ++i) {
+		for (s32 i = 0; i < 9; ++i) {
 			s32x8 gx = s32x8_set1(x + chunk_position.x * CHUNKW);
 			s32x8 gy = s32x8_set1(y + chunk_position.y * CHUNKW);
 			s32x8 gz = s32x8_add(s32x8_set1(z + chunk_position.z * CHUNKW), s32x8_set(0,1,2,3,4,5,6,7));
@@ -643,7 +542,7 @@ void generate_sdf(Chunk &chunk, v3s chunk_position) {
 			f32x8 right = f32x8_lerp(right_bottom, right_top, ty);
 
 			f32x8 h = f32x8_lerp(left, right, tx);
-			h = f32x8_mul(f32x8_sub(h, f32x8_add(f32x8_set1(0.5f), f32x8_mul(s32x8_to_f32x8(gy), f32x8_set1(1)))), f32x8_set1(scale));
+			h = f32x8_mul(f32x8_sub(h, f32x8_add(f32x8_set1(0.5f), f32x8_mul(s32x8_to_f32x8(gy), f32x8_set1(0.5f)))), f32x8_set1(scale));
 			//h = f32x8_mul(f32x8_sub(h, f32x8_mul(s32x8_to_f32x8(gy), f32x8_set1(8))), f32x8_set1(scale));
 			//d = f32x8_add(d, f32x8_add(f32x8_set1(-0.5f), f32x8_mul(s32x8_to_f32x8(s32x8_sub(s32x8_set1(CHUNKW/2), gy)), f32x8_set1(0.0125f))));
 			d = f32x8_add(d, h);
@@ -817,112 +716,32 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 		else static_assert(false);
 	};
 
+	Chunk *neighbors[8];
+	neighbors[0b000] = &chunk;
+	neighbors[0b001] = &get_chunk(chunk_position+v3s{0,0,1});
+	neighbors[0b010] = &get_chunk(chunk_position+v3s{0,1,0});
+	neighbors[0b011] = &get_chunk(chunk_position+v3s{0,1,1});
+	neighbors[0b100] = &get_chunk(chunk_position+v3s{1,0,0});
+	neighbors[0b101] = &get_chunk(chunk_position+v3s{1,0,1});
+	neighbors[0b110] = &get_chunk(chunk_position+v3s{1,1,0});
+	neighbors[0b111] = &get_chunk(chunk_position+v3s{1,1,1});
+
 	auto sdf = [&](s32 x, s32 y, s32 z) {
 		x -= (x == lodw*2);
 		y -= (y == lodw*2);
 		z -= (z == lodw*2);
-		if (x < lodw) {
-			if (y < lodw) {
-				if (z < lodw) {
-					return get_sdf(&chunk)[x][y][z];
-				} else {
-					return get_sdf(&get_chunk(chunk_position+v3s{0,0,1}))[x][y][z-lodw];
-				}
-			} else {
-				if (z < lodw) {
-					return get_sdf(&get_chunk(chunk_position+v3s{0,1,0}))[x][y-lodw][z];
-				} else {
-					return get_sdf(&get_chunk(chunk_position+v3s{0,1,1}))[x][y-lodw][z-lodw];
-				}
-			}
-		} else {
-			if (y < lodw) {
-				if (z < lodw) {
-					return get_sdf(&get_chunk(chunk_position+v3s{1,0,0}))[x-lodw][y][z];
-				} else {
-					return get_sdf(&get_chunk(chunk_position+v3s{1,0,1}))[x-lodw][y][z-lodw];
-				}
-			} else {
-				if (z < lodw) {
-					return get_sdf(&get_chunk(chunk_position+v3s{1,1,0}))[x-lodw][y-lodw][z];
-				} else {
-					return get_sdf(&get_chunk(chunk_position+v3s{1,1,1}))[x-lodw][y-lodw][z-lodw];
-				}
-			}
-		}
+
+		auto lx = x - (x >= lodw) * lodw;
+		auto ly = y - (y >= lodw) * lodw;
+		auto lz = z - (z >= lodw) * lodw;
+
+		u32 neighbor_index =
+			((x >= lodw) << 2) |
+			((y >= lodw) << 1) |
+			((z >= lodw) << 0);
+
+		return get_sdf(neighbors[neighbor_index])[lx][ly][lz];
 	};
-
-#if 0
-	s32 sdf_[lodw+4][lodw+4][lodw+4]{};
-	{
-		timed_block(profiler, profile_frame, "sdf filtering");
-		for (s32 x = 0; x < CHUNKW; ++x) {
-		for (s32 y = 0; y < CHUNKW; ++y) {
-		for (s32 z = 0; z < CHUNKW; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += chunk.sdf0[x][y][z];
-		}
-		}
-		}
-		Chunk *neighbor;
-
-		neighbor = &get_chunk(chunk_position+v3s{1,0,0});
-		for (s32 x = CHUNKW; x < lbounds.x*CHUNKW/lodw; ++x) {
-		for (s32 y = 0; y < CHUNKW; ++y) {
-		for (s32 z = 0; z < CHUNKW; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += neighbor->sdf0[min(CHUNKW-1,x-CHUNKW)][y][z];
-		}
-		}
-		}
-		neighbor = &get_chunk(chunk_position+v3s{0,1,0});
-		for (s32 x = 0; x < CHUNKW; ++x) {
-		for (s32 y = CHUNKW; y < lbounds.y*CHUNKW/lodw; ++y) {
-		for (s32 z = 0; z < CHUNKW; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += neighbor->sdf0[x][min(CHUNKW-1,y-CHUNKW)][z];
-		}
-		}
-		}
-		neighbor = &get_chunk(chunk_position+v3s{1,1,0});
-		for (s32 x = CHUNKW; x < lbounds.x*CHUNKW/lodw; ++x) {
-		for (s32 y = CHUNKW; y < lbounds.y*CHUNKW/lodw; ++y) {
-		for (s32 z = 0; z < CHUNKW; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += neighbor->sdf0[min(CHUNKW-1,x-CHUNKW)][min(CHUNKW-1,y-CHUNKW)][z];
-		}
-		}
-		}
-		neighbor = &get_chunk(chunk_position+v3s{0,0,1});
-		for (s32 x = 0; x < CHUNKW; ++x) {
-		for (s32 y = 0; y < CHUNKW; ++y) {
-		for (s32 z = CHUNKW; z < lbounds.z*CHUNKW/lodw; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += neighbor->sdf0[x][y][min(CHUNKW-1,z-CHUNKW)];
-		}
-		}
-		}
-		neighbor = &get_chunk(chunk_position+v3s{1,0,1});
-		for (s32 x = CHUNKW; x < lbounds.x*CHUNKW/lodw; ++x) {
-		for (s32 y = 0; y < CHUNKW; ++y) {
-		for (s32 z = CHUNKW; z < lbounds.z*CHUNKW/lodw; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += neighbor->sdf0[min(CHUNKW-1,x-CHUNKW)][y][min(CHUNKW-1,z-CHUNKW)];
-		}
-		}
-		}
-		neighbor = &get_chunk(chunk_position+v3s{0,1,1});
-		for (s32 x = 0; x < CHUNKW; ++x) {
-		for (s32 y = CHUNKW; y < lbounds.y*CHUNKW/lodw; ++y) {
-		for (s32 z = CHUNKW; z < lbounds.z*CHUNKW/lodw; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += neighbor->sdf0[x][min(CHUNKW-1,y-CHUNKW)][min(CHUNKW-1,z-CHUNKW)];
-		}
-		}
-		}
-		neighbor = &get_chunk(chunk_position+v3s{1,1,1});
-		for (s32 x = CHUNKW; x < lbounds.x*CHUNKW/lodw; ++x) {
-		for (s32 y = CHUNKW; y < lbounds.y*CHUNKW/lodw; ++y) {
-		for (s32 z = CHUNKW; z < lbounds.z*CHUNKW/lodw; ++z) {
-			sdf_[x*lodw/CHUNKW][y*lodw/CHUNKW][z*lodw/CHUNKW] += neighbor->sdf0[min(CHUNKW-1,x-CHUNKW)][min(CHUNKW-1,y-CHUNKW)][min(CHUNKW-1,z-CHUNKW)];
-		}
-		}
-		}
-	}
-#endif
 
 
 	u8 edges[][2] {
@@ -954,12 +773,14 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 	Vertex points[lodw+3][lodw+3][lodw+3];
 
 	// DEBUG:
+#if 0
 	for (auto &point : flatten(points)) {
 		point = Vertex{
 			.position = {0, 999, 0},
 			.normal = {0, 1, 0},
 		};
 	}
+#endif
 
 	u32 edge_count = 0;
 
@@ -1015,7 +836,7 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 				point /= divisor;
 				points[lx][ly][lz].position = point * (CHUNKW/lodw) + V3f(cx,cy,cz);
 #endif
-				//points[lx][ly][lz].position.y -= 1 << (log2(CHUNKW) - log2(lodw));
+				points[lx][ly][lz].position += 0.5f * ((1 << (log2(CHUNKW) - log2(lodw))) >> 1);
 #if 0
 				points[lx][ly][lz].normal = -sdf_gradient(d, point);
 #else
@@ -1140,11 +961,7 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 	}
 #endif
 
-	if (chunk.vertex_buffer) {
-		chunk.vertex_buffer->Release();
-		chunk.vertex_buffer = 0;
-	}
-	chunk.vertices.clear();
+	chunk.positions.clear();
 
 #if USE_INDICES
 	if (chunk.index_buffer) {
@@ -1159,20 +976,25 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 		return;
 
 	for (auto vertex : vertices)
-		chunk.vertices.add(vertex.position);
-	chunk.vert_count = vertices.count;
+		chunk.positions.add(vertex.position);
+
+	auto lod_index = log2(CHUNKW) - log2(lodw);
 
 #if USE_INDICES
 	for (auto index : indices)
 		chunk.indices.add(index);
 	chunk.indices_count = indices.count;
+#else
+	chunk.vertex_buffers[lod_index].vertex_count = vertices.count;
 #endif
 
 	timed_block(profiler, profile_frame, "buffer generation");
 
+#if 1
+	auto &vertex_buffer = chunk.vertex_buffers[lod_index].view;
 
-	ID3D11Buffer *vertex_buffer;
-	defer { vertex_buffer->Release(); };
+	ID3D11Buffer *buffer;
+	defer { buffer->Release(); };
 
 	{
 		D3D11_BUFFER_DESC desc {
@@ -1187,11 +1009,12 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 			.pSysMem = vertices.data,
 		};
 
-		dhr(device->CreateBuffer(&desc, &init, &vertex_buffer));
+		dhr(device->CreateBuffer(&desc, &init, &buffer));
 	}
 	{
-		dhr(device->CreateShaderResourceView(vertex_buffer, 0, &chunk.vertex_buffer));
+		dhr(device->CreateShaderResourceView(buffer, 0, &vertex_buffer));
 	}
+#endif
 
 #if USE_INDICES
 	{
@@ -1217,21 +1040,24 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 	chunks_with_meshes.insert(&chunk);
 }
 
-void update_chunk_mesh(Chunk &chunk, v3s chunk_position, u32 lodw) {
+void update_chunk_mesh(Chunk &chunk, v3s chunk_position) {
 	scoped_lock(chunk.mutex);
 
 	timed_function(profiler, profile_frame);
 
-	switch (lodw) {
-		case 1:   generate_chunk_lod<1  >(chunk, chunk_position); break;
-		case 2:   generate_chunk_lod<2  >(chunk, chunk_position); break;
-		case 4:   generate_chunk_lod<4  >(chunk, chunk_position); break;
-		case 8:   generate_chunk_lod<8  >(chunk, chunk_position); break;
-		case 16:  generate_chunk_lod<16 >(chunk, chunk_position); break;
-		case 32:  generate_chunk_lod<32 >(chunk, chunk_position); break;
-		// case 64:  generate_chunk_lod<64 >(chunk, chunk_position); break;
-		default: invalid_code_path();
+	for (auto &vertex_buffer : chunk.vertex_buffers) {
+		if (vertex_buffer.view) {
+			vertex_buffer.view->Release();
+			vertex_buffer.view = 0;
+		}
 	}
+	generate_chunk_lod<1 >(chunk, chunk_position);
+	generate_chunk_lod<2 >(chunk, chunk_position);
+	generate_chunk_lod<4 >(chunk, chunk_position);
+	generate_chunk_lod<8 >(chunk, chunk_position);
+	generate_chunk_lod<16>(chunk, chunk_position);
+	generate_chunk_lod<32>(chunk, chunk_position);
+	chunk.mesh_generated = true;
 }
 
 void start() {
@@ -1246,8 +1072,6 @@ bool chunk_in_view(v3s position) {
 }
 
 extern "C" const Array<v3s8, pow3(DRAWD*2+1)> grid_map;
-
-u32 chunks_remeshed_previous_frame;
 
 u32 thread_count;
 
@@ -1276,14 +1100,40 @@ struct ChunkAndPosition {
 
 u32 iter_from_center_offset_sdf = 0;
 u32 iter_from_center_offset_mesh = 0;
+s32 n_sdfs_can_generate_this_frame;
+u32 remesh_count = 0;
+
+s32 get_chunk_lod_index(v3s p) {
+	p -= camera->position.chunk;
+	auto distance = max(absolute(p.x),absolute(p.y),absolute(p.z));
+	return log2(max(distance, 1));
+}
 
 void generate_chunks_around() {
+	auto generate_timer = create_precise_timer();
+	defer { generate_time = get_time(generate_timer); };
+
 	timed_function(profiler, profile_frame);
 
-	auto avg_sdf_generation_seconds = total_sdfs_generated ? (f32)(total_time_wasted_on_generating_sdfs / total_sdfs_generated) / performance_frequency : 0.1f;
-	// NOTE: this assumes that sdf generation takes 25% of a frame
-	auto n_sdfs_can_generate_this_frame = max(1, floor_to_int(frame_time / avg_sdf_generation_seconds) * thread_count * 0.25f);
+	f32 available_time = max(0, frame_time - update_time);
 	s32 n_sdfs_generated = 0;
+
+	if (sdfs_generated_per_frame) {
+		auto avg = (f32)generate_time / sdfs_generated_per_frame;
+		if (smoothed_average_generation_time == 0) {
+			smoothed_average_generation_time = avg;
+		} else {
+			smoothed_average_generation_time = lerp(smoothed_average_generation_time, avg, frame_time);
+		}
+		sdfs_generated_per_frame = 0;
+	}
+
+	n_sdfs_can_generate_this_frame =
+		smoothed_average_generation_time == 0 ?
+		thread_count :
+		max(thread_count, floor_to_int(available_time / smoothed_average_generation_time));
+
+	print("{}\n", n_sdfs_can_generate_this_frame);
 
 	auto work = make_work_queue(thread_pool);
 
@@ -1305,11 +1155,13 @@ void generate_chunks_around() {
 			auto r = absolute(chunk_position - camera->position.chunk);
 			assert(r.x > DRAWD || r.y > DRAWD || r.z > DRAWD);
 			auto &chunk = get_chunk(chunk_position);
-			if (chunk.vertex_buffer) {
-				chunk.vertex_buffer->Release();
-				chunk.vertex_buffer = 0;
+			for (auto &vertex_buffer : chunk.vertex_buffers) {
+				if (vertex_buffer.view) {
+					vertex_buffer.view->Release();
+					vertex_buffer.view = 0;
+				}
+				vertex_buffer.vertex_count = 0;
 			}
-			chunk.vert_count = 0;
 #if USE_INDICES
 			if (chunk.index_buffer) {
 				chunk.index_buffer->Release();
@@ -1318,7 +1170,6 @@ void generate_chunks_around() {
 			chunk.indices_count = 0;
 #endif
 			chunk.sdf_generated = false;
-			chunk.lod_width = 0;
 			chunk.neighbor_mask = {};
 
 			if (chunk.was_modified) {
@@ -1331,68 +1182,92 @@ void generate_chunks_around() {
 		}
 		}
 	}
+
+	u32 iter_from_center_offset_sdf_end = 0;
+
+	auto remesh = [&] (Chunk *chunk, v3s chunk_position) {
+		work.push([chunk, chunk_position] {
+			update_chunk_mesh(*chunk, chunk_position);
+		});
+		remesh_count++;
+		//print("remesh {}\n", chunk->position);
+	};
+
 	{
 		timed_block(profiler, profile_frame, "generate sdfs");
-		bool reached_not_generated = false;
-		for (auto pp_small = grid_map.begin() + iter_from_center_offset_sdf; pp_small != grid_map.end(); ++pp_small) {
+		remesh_count = 0;
+		bool reached_not_generated_sdf = false;
+		bool reached_not_generated_mesh = false;
+		for (auto pp_small = grid_map.begin() + min(iter_from_center_offset_sdf, iter_from_center_offset_mesh); pp_small != grid_map.end(); ++pp_small) {
 			auto &p_small = *pp_small;
 			auto p = (v3s)p_small;
 			auto chunk_position = camera->position.chunk + p;
 			auto &chunk = get_chunk(chunk_position);
-			if (!chunk.sdf_generated) {
-				if (!reached_not_generated) {
-					reached_not_generated = true;
+			if (chunk.sdf_generated) {
+				if (chunk.mesh_generated) {
+					auto new_neighbor_mask = get_neighbor_mask(chunk_position);
+					if (chunk.neighbor_mask != new_neighbor_mask) {
+						chunk.neighbor_mask = new_neighbor_mask;
+						remesh(&chunk, chunk_position);
+					}
+				} else {
+					// NOTE: mesh is not generated immediately for chunks loaded from disk
+					remesh(&chunk, chunk_position);
+				}
+			} else {
+				if (!reached_not_generated_sdf) {
+					reached_not_generated_sdf = true;
 					iter_from_center_offset_sdf = pp_small - grid_map.data;
 				}
-				//if (chunk_in_view(chunk_position)) {
-					if (auto found = saved_chunks.find(chunk_position)) {
-						memcpy(chunk.sdf0, found->value.sdf, sizeof(chunk.sdf0));
-						filter_sdf(chunk);
-						chunk.sdf_generated = true;
-					} else {
+
+				chunk.neighbor_mask = get_neighbor_mask(chunk_position);
+				if (auto found = saved_chunks.find(chunk_position)) {
+					work.push([chunk = &chunk, chunk_position, found]{
+						memcpy(chunk->sdf0, found->value.sdf, sizeof(chunk->sdf0));
+						filter_sdf(*chunk);
+						chunk->sdf_generated = true;
+						update_chunk_mesh(*chunk, chunk_position);
+					});
+				} else {
+					if (n_sdfs_generated < n_sdfs_can_generate_this_frame) {
+						n_sdfs_generated += 1;
 						work.push([chunk = &chunk, chunk_position]{
 							generate_sdf(*chunk, chunk_position);
+							update_chunk_mesh(*chunk, chunk_position);
 						});
+						remesh_count++;
 					}
-					n_sdfs_generated += 1;
-					if (n_sdfs_generated == n_sdfs_can_generate_this_frame) {
-						goto _end;
-					}
-				//}
+				}
+			}
+
+			bool has_full_mesh =
+				any_true(chunk_position == camera->position.chunk + DRAWD) ?
+				chunk.sdf_generated && (chunk.neighbor_mask.x || chunk.neighbor_mask.y || chunk.neighbor_mask.z) : // these are on the edge of draw distance, they will never have neighbors therefore full mesh
+				chunk.sdf_generated && chunk.neighbor_mask.x && chunk.neighbor_mask.y && chunk.neighbor_mask.z; //
+
+			if (!has_full_mesh) {
+				if (!reached_not_generated_mesh) {
+					reached_not_generated_mesh = true;
+					iter_from_center_offset_mesh = pp_small - grid_map.data;
+				}
 			}
 		}
-		_end:;
 	}
 	{
+#if 0
 		timed_block(profiler, profile_frame, "remesh chunks");
 
-		auto remesh = [&] (Chunk *chunk, v3s chunk_position) {
-			work.push([chunk, chunk_position, lod_width = chunk->lod_width] {
-				update_chunk_mesh(*chunk, chunk_position, lod_width);
-			});
-			//print("remesh {}\n", chunk->position);
-		};
 
-		auto get_lodw_from_distance = [&](s32 distance) {
-			for (s32 i = 1; i < CHUNKW; i *= 2)
-				if (distance <= i)
-					return CHUNKW/i;
-
-			return 2;
-		};
-
-
-		u32 remesh_count = 0;
+		remesh_count = 0;
 
 		bool reached_not_generated = false;
 
-		for (auto pp_small = grid_map.begin() + iter_from_center_offset_mesh; pp_small != grid_map.end(); ++pp_small) {
+		for (auto pp_small = grid_map.begin() + iter_from_center_offset_mesh; pp_small != grid_map.begin() + iter_from_center_offset_sdf_end; ++pp_small) {
 			auto &p_small = *pp_small;
 			auto p = (v3s)p_small;
 			auto chunk_position = camera->position.chunk + p;
 
-			auto lodw = get_lodw_from_distance(max(absolute(p.x),absolute(p.y),absolute(p.z)));
-			auto lod_index = log2(lodw);
+			auto lod_index = get_chunk_lod_index(p);
 
 			//if (visible)
 			//	if (lodw == 32)
@@ -1403,43 +1278,6 @@ void generate_chunks_around() {
 			auto &chunk = get_chunk(chunk_position);
 
 			if (chunk.sdf_generated) {
-				auto new_neighbor_mask = get_neighbor_mask(chunk_position);
-				if (chunk.neighbor_mask != new_neighbor_mask) {
-					chunk.neighbor_mask = new_neighbor_mask;
-					chunk.lod_width = lodw;
-					remesh(&chunk, chunk_position);
-					did_remesh = true;
-				} else {
-					if (chunk.lod_width < lodw) {
-						if (chunk_in_view(chunk_position)) {
-							chunk.lod_width = lodw;
-							remesh(&chunk, chunk_position);
-							did_remesh = true;
-						}
-					} else if (chunk.lod_width > lodw) {
-						chunk.lod_width = lodw;
-						remesh(&chunk, chunk_position);
-						did_remesh = true;
-					}
-				}
-
-					// if (chunk.lod_width < lodw) {
-					// 	if (visible) {
-					// 		chunk.lod_width = lodw;
-					// 		remesh(&*chunk);
-					// 		did_remesh = true;
-					// 	}
-					// } else if (chunk.lod_width > lodw) {
-					// 	chunk.lod_width = lodw;
-					// 	remesh(&*chunk);
-					// 	did_remesh = true;
-					// }
-
-				if (did_remesh) {
-					remesh_count++;
-				}
-			} else {
-				did_remesh = true;
 			}
 
 			bool has_full_mesh =
@@ -1456,7 +1294,7 @@ void generate_chunks_around() {
 		}
 		_end2:
 		//print("remesh_count: {}\n", remesh_count);
-		chunks_remeshed_previous_frame = remesh_count;
+#endif
 	}
 
 	{
@@ -1507,10 +1345,10 @@ RayHit global_raycast(ChunkRelativePosition origin_crp, v3f direction, f32 max_d
 				auto b = chunk.vertices[chunk.indices[i+1]];
 				auto c = chunk.vertices[chunk.indices[i+2]];
 #else
-			for (u32 i = 0; i < chunk.vertices.count; i += 3) {
-				auto a = chunk.vertices[i+0];
-				auto b = chunk.vertices[i+1];
-				auto c = chunk.vertices[i+2];
+			for (u32 i = 0; i < chunk.positions.count; i += 3) {
+				auto a = chunk.positions[i+0];
+				auto b = chunk.positions[i+1];
+				auto c = chunk.positions[i+2];
 #endif
 
 				if (auto hit = raycast(ray, triangle{a,b,c})) {
@@ -1535,8 +1373,6 @@ RayHit global_raycast(ChunkRelativePosition origin_crp, v3f direction, f32 max_d
 
 	return result;
 }
-
-List<ChunkAndPosition> visible_chunks;
 
 bool cursor_is_locked;
 void lock_cursor() {
@@ -1618,7 +1454,7 @@ void add_sdf_sphere(ChunkRelativePosition position, s32 radius, s32 strength) {
 		if (chunk.sdf_generated) {
 			chunk.was_modified = true;
 			work.push([chunk = &chunk, chunk_position = v3s{x,y,z}] {
-				update_chunk_mesh(*chunk, chunk_position, chunk->lod_width);
+				update_chunk_mesh(*chunk, chunk_position);
 			});
 		}
 	}
@@ -1742,7 +1578,13 @@ Optional<v3f> gradient_at(ChunkRelativePosition position) {
 	return normalize(v);
 }
 
+s32 debug_selected_lod = -1;
+
 void update() {
+	auto update_timer = create_precise_timer();
+	defer { update_time = get_time(update_timer); };
+
+
 	// NOTE: all camera->position modifications must happen AFTER saving position at previous frame.
 	camera_chunk_last_frame = camera->position.chunk;
 
@@ -1763,6 +1605,15 @@ void update() {
 			unlock_cursor();
 		else
 			lock_cursor();
+	}
+
+	if (key_down('3')) {
+		if (debug_selected_lod != -1)
+			debug_selected_lod -= 1;
+	}
+	if (key_down('4')) {
+		if (debug_selected_lod != 5)
+			debug_selected_lod += 1;
 	}
 
 	v3f camera_position_delta {
@@ -1938,7 +1789,7 @@ void update() {
 
 	if (mouse_held(0) || mouse_held(1)) {
 		if (auto hit = global_raycast(camera->position, camera_forward, CHUNKW*2)) {
-			add_sdf_sphere(hit.position + camera_forward * (brush_size - 1.1) * (mouse_held(0) ? 1 : -1), brush_size, brush_size * 32 * (mouse_held(0) ? 1 : -1));
+			add_sdf_sphere(hit.position + camera_forward * (brush_size - 1.5) * (mouse_held(0) ? 1 : -1), brush_size, brush_size * 32 * (mouse_held(0) ? 1 : -1));
 		}
 	}
 
@@ -1979,7 +1830,6 @@ void update() {
 	//}
 
 
-
 	immediate_context->VSSetConstantBuffers(0, 1, &frame_cbuffer.cbuffer);
 	immediate_context->PSSetConstantBuffers(0, 1, &frame_cbuffer.cbuffer);
 	immediate_context->VSSetConstantBuffers(1, 1, &chunk_cbuffer.cbuffer);
@@ -2015,10 +1865,14 @@ void update() {
 
 		auto light_vp_matrix = m4::scale(1.f/shadow_world_size) * m4::rotation_r_yxz(-light_angles) * m4::translation(-lightpos);
 
+		auto light_mvp = m4::translation(0,0,.5) * m4::scale(1,1,.5) * light_vp_matrix;
+
 		frame_cbuffer.update({
 			//.mvp = m4::scale(.1f * v3f{(f32)window_client_size.x / window_client_size.y, 1, 1}) * m4::rotation_r_yxz(-v3f{pi}),
-			.mvp = m4::translation(0,0,.5) * m4::scale(1,1,.5) * light_vp_matrix,
+			.mvp = light_mvp
 		});
+		auto light_frustum = create_frustum_planes_d3d(light_mvp);
+
 
 		{
 			D3D11_VIEWPORT viewport {
@@ -2039,25 +1893,27 @@ void update() {
 		immediate_context->OMSetBlendState(0, {}, -1);
 		immediate_context->ClearRenderTargetView(shadow_rtv, v4f{}.s);
 		immediate_context->ClearDepthStencilView(shadow_dsv, D3D11_CLEAR_DEPTH, 1, 0);
-		for_each(chunks_with_meshes, [&](Chunk *chunk) {
-			auto chunk_position = get_chunk_position(chunk);
-			if (chunk->vertex_buffer) {
+		for (auto &chunk : flatten(chunks)) {
+			auto chunk_position = get_chunk_position(&chunk);
+			auto &vertex_buffer = chunk.vertex_buffers[debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod];
+			if (vertex_buffer.view) {
 				auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-				chunk_cbuffer.update({
-					.relative_position = relative_position,
-					.actual_position = (v3f)(chunk_position*CHUNKW),
-				});
+				if (contains_sphere(light_frustum, relative_position+V3f(CHUNKW/2), sqrt3*CHUNKW)) {
+					chunk_cbuffer.update({
+						.relative_position = relative_position,
+						.actual_position = (v3f)(chunk_position*CHUNKW),
+					});
 
-				immediate_context->VSSetShaderResources(0, 1, &chunk->vertex_buffer);
+					immediate_context->VSSetShaderResources(0, 1, &vertex_buffer.view);
 #if USE_INDICES
-				immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-				immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
+					immediate_context->IASetIndexBuffer(chunk.index_buffer, DXGI_FORMAT_R32_UINT, 0);
+					immediate_context->DrawIndexed(chunk.indices_count, 0, 0);
 #else
-				immediate_context->Draw(chunk->vert_count, 0);
+					immediate_context->Draw(vertex_buffer.vertex_count, 0);
 #endif
+				}
 			}
-		});
-
+		}
 		immediate_context->OMSetRenderTargets(0, 0, 0);
 		immediate_context->PSSetShaderResources(3, 1, &shadow_srv);
 
@@ -2120,15 +1976,12 @@ void update() {
 		immediate_context->VSSetShader(chunk_vs, 0, 0);
 		immediate_context->PSSetShader(chunk_solid_ps, 0, 0);
 
-		visible_chunks.clear();
-
 		for (auto &chunk : flatten(chunks)) {
 			auto chunk_position = get_chunk_position(&chunk);
-			if (chunk.vertex_buffer) {
+			auto &vertex_buffer = chunk.vertex_buffers[debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod];
+			if (vertex_buffer.view) {
 				timed_block(profiler, profile_frame, "draw chunk");
-				bool visible = chunk_in_view(chunk_position);
-				if (visible) {
-					visible_chunks.add({&chunk, chunk_position});
+				if (chunk_in_view(chunk_position)) {
 					auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
 					chunk_cbuffer.update({
 						.relative_position = relative_position,
@@ -2136,12 +1989,12 @@ void update() {
 						.actual_position = (v3f)(chunk_position*CHUNKW),
 					});
 
-					immediate_context->VSSetShaderResources(0, 1, &chunk.vertex_buffer);
+					immediate_context->VSSetShaderResources(0, 1, &vertex_buffer.view);
 #if USE_INDICES
 					immediate_context->IASetIndexBuffer(chunk.index_buffer, DXGI_FORMAT_R32_UINT, 0);
 					immediate_context->DrawIndexed(chunk.indices_count, 0, 0);
 #else
-					immediate_context->Draw(chunk.vert_count, 0);
+					immediate_context->Draw(vertex_buffer.vertex_count, 0);
 #endif
 				}
 			}
@@ -2155,22 +2008,27 @@ void update() {
 		immediate_context->RSSetState(wireframe_rasterizer);
 		immediate_context->PSSetShader(chunk_wire_ps, 0, 0);
 		immediate_context->OMSetBlendState(alpha_blend, {}, -1);
-		for (auto chunk_and_position : visible_chunks) {
-			auto chunk = chunk_and_position.chunk;
-			auto chunk_position = chunk_and_position.position;
-			auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-			chunk_cbuffer.update({
-				.relative_position = relative_position,
-				.actual_position = (v3f)(chunk_position*CHUNKW),
-			});
+		for (auto &chunk : flatten(chunks)) {
+			auto chunk_position = get_chunk_position(&chunk);
+			auto &vertex_buffer = chunk.vertex_buffers[debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod];
+			if (vertex_buffer.view) {
+				if (chunk_in_view(chunk_position)) {
+					timed_block(profiler, profile_frame, "draw chunk wire");
+					auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
+					chunk_cbuffer.update({
+						.relative_position = relative_position,
+						.actual_position = (v3f)(chunk_position*CHUNKW),
+					});
 
-			immediate_context->VSSetShaderResources(0, 1, &chunk->vertex_buffer);
+					immediate_context->VSSetShaderResources(0, 1, &vertex_buffer.view);
 #if USE_INDICES
-				immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-				immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
+					immediate_context->IASetIndexBuffer(chunk.index_buffer, DXGI_FORMAT_R32_UINT, 0);
+					immediate_context->DrawIndexed(chunk.indices_count, 0, 0);
 #else
-				immediate_context->Draw(chunk->vert_count, 0);
+					immediate_context->Draw(vertex_buffer.vertex_count, 0);
 #endif
+				}
+			}
 		}
 	}
 
@@ -2203,18 +2061,29 @@ void update() {
 	{
 		timed_block(profiler, profile_frame, "ui");
 		StringBuilder builder;
-		append_format(builder, u8R"(fps: {}
+		append_format(builder, u8R"(fly/walk - F; sculpt - left/right mouse; brush size - 1/2; reset position - H; grenade - middle mouse;
+fps: {}
 brush_size: {}
 camera->position: {}
 iter_from_center_offset_sdf: {}
 iter_from_center_offset_mesh: {}
+smoothed_average_generation_time: {} ms
+generate_time: {} ms
+sdfs_generated_per_frame: {}
+n_sdfs_can_generate_this_frame: {}
+remesh_count: {}
 profile:
 )"s,
 smooth_fps,
 brush_size,
 camera->position,
 iter_from_center_offset_sdf,
-iter_from_center_offset_mesh
+iter_from_center_offset_mesh,
+smoothed_average_generation_time * 1000,
+generate_time * 1000,
+sdfs_generated_per_frame,
+n_sdfs_can_generate_this_frame,
+remesh_count
 );
 		HashMap<Span<utf8>, u64> time_spans;
 		for (auto &span : profiler.recorded_time_spans) {
@@ -2288,9 +2157,6 @@ iter_from_center_offset_mesh
 			immediate_context->Draw(vertices.count, 0);
 		}
 	}
-
-
-	swap_chain->Present(1, 0);
 }
 void resize() {
 	if (swap_chain) {
@@ -2439,7 +2305,6 @@ cbuffer _ : register(b1) {
 struct Vertex {
 	float3 position;
 	float3 normal;
-	uint parent_vertex;
 };
 
 StructuredBuffer<Vertex> s_vertex_buffer : register(t0);
@@ -2667,6 +2532,7 @@ void main(
 
 	float fog = min(1, length(view) / ()" STRINGIZE(CHUNKW*DRAWD) R"());
 	fog *= fog;
+	fog *= fog;
 	pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
 
 	//pixel_color = shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01);
@@ -2828,7 +2694,6 @@ cbuffer _ : register(b1) {
 struct Vertex {
 	float3 position;
 	float3 normal;
-	uint parent_vertex;
 };
 
 StructuredBuffer<Vertex> s_vertex_buffer : register(t0);
@@ -3210,7 +3075,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
 	_chunks = (decltype(_chunks))VirtualAlloc(0, sizeof(Chunk) * pow3(DRAWD*2+1), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
 	for (auto &chunk : flatten(chunks)) {
-		construct(chunk.vertices);
+		construct(chunk.positions);
 #if USE_INDICES
 		construct(chunk.indices);
 #endif
@@ -3219,7 +3084,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 	construct(profiler);
 	construct(thread_pool);
 	construct(chunks_with_meshes);
-	construct(visible_chunks);
 	construct(entities);
 	construct(saved_chunks);
 	thread_count = get_cpu_info().logical_processor_count;
@@ -3347,15 +3211,7 @@ skip_load:
 
 				auto count = end_index - first_index;
 
-				//encode_int32_multibyte(count, [&](u8 b){write(b);});
-				{
-					auto x = count;
-					while (x >= 0x80) {
-						write((u8)((x & 0x7F) | 0x80));
-						x >>= 7;
-					}
-					write((u8)x);
-				}
+				encode_int32_multibyte(count, [&](u8 b){write(b);});
 
 				write((s8)first);
 
@@ -3526,6 +3382,7 @@ skip_load:
 
 		update();
 
+		swap_chain->Present(1, 0);
 
 		for (auto &state : key_state) {
 			if (state & KeyState_down) {
@@ -3540,14 +3397,12 @@ skip_load:
 
 		sync(frame_time_counter, frame_time);
 
+		// NOTE: Reset chunk generation time each second
 		//if (get_performance_counter() >= stat_reset_timer + performance_frequency) {
-		//	stat_reset_timer = get_performance_counter();
-		//	actual_fps.reset();
+		//	stat_reset_timer += performance_frequency;
+		//	time_wasted_on_generating_chunks_per_frame = 0;
+		//	sdfs_generated_per_frame = 0;
 		//}
-
-		// actual_fps.set(1.0f / reset(actual_frame_timer));
-		//print("{}\n", *1000);
-		//print("{}\n", iter_from_center_offset_mesh);
 
 		smooth_fps = lerp(smooth_fps, 1.0f / (f32)reset(actual_frame_timer), 0.25f);
 	}

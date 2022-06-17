@@ -27,5 +27,3 @@ f32 cursor_speed;
 f32 mouse_wheel_delta;
 
 v2u window_client_size;
-
-f32 frame_time;
