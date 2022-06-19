@@ -3,6 +3,12 @@
 // For some reason chunks that become on the edge remesh when they don't have to.
 
 #define _CRT_SECURE_NO_WARNINGS
+#define _WINSOCK_DEPRECATED_NO_WARNINGS
+
+#define NOMINMAX
+#include <WS2tcpip.h>
+#include <winsock2.h>
+
 #define TL_IMPL
 #define TL_DEBUG 1
 #include <tl/common.h>
@@ -18,6 +24,7 @@
 #include <tl/profiler.h>
 #include <tl/cpu.h>
 #include <tl/simd.h>
+#include <tl/net.h>
 
 #pragma comment(lib, "freetype.lib")
 
@@ -28,6 +35,7 @@ using namespace tl;
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 #include "cbuffer.h"
 #include "input.h"
@@ -37,7 +45,109 @@ using namespace tl;
 #define TL_FONT_TEXTURE_HANDLE ID3D11ShaderResourceView *
 #include <tl/font.h>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 #define USE_INDICES 0
+
+void print_wsa_error() {
+	switch (WSAGetLastError()) {
+#define C(x) case x: print(#x); break;
+		C(WSAEINTR                         )
+		C(WSAEBADF                         )
+		C(WSAEACCES                        )
+		C(WSAEFAULT                        )
+		C(WSAEINVAL                        )
+		C(WSAEMFILE                        )
+		C(WSAEWOULDBLOCK                   )
+		C(WSAEINPROGRESS                   )
+		C(WSAEALREADY                      )
+		C(WSAENOTSOCK                      )
+		C(WSAEDESTADDRREQ                  )
+		C(WSAEMSGSIZE                      )
+		C(WSAEPROTOTYPE                    )
+		C(WSAENOPROTOOPT                   )
+		C(WSAEPROTONOSUPPORT               )
+		C(WSAESOCKTNOSUPPORT               )
+		C(WSAEOPNOTSUPP                    )
+		C(WSAEPFNOSUPPORT                  )
+		C(WSAEAFNOSUPPORT                  )
+		C(WSAEADDRINUSE                    )
+		C(WSAEADDRNOTAVAIL                 )
+		C(WSAENETDOWN                      )
+		C(WSAENETUNREACH                   )
+		C(WSAENETRESET                     )
+		C(WSAECONNABORTED                  )
+		C(WSAECONNRESET                    )
+		C(WSAENOBUFS                       )
+		C(WSAEISCONN                       )
+		C(WSAENOTCONN                      )
+		C(WSAESHUTDOWN                     )
+		C(WSAETOOMANYREFS                  )
+		C(WSAETIMEDOUT                     )
+		C(WSAECONNREFUSED                  )
+		C(WSAELOOP                         )
+		C(WSAENAMETOOLONG                  )
+		C(WSAEHOSTDOWN                     )
+		C(WSAEHOSTUNREACH                  )
+		C(WSAENOTEMPTY                     )
+		C(WSAEPROCLIM                      )
+		C(WSAEUSERS                        )
+		C(WSAEDQUOT                        )
+		C(WSAESTALE                        )
+		C(WSAEREMOTE                       )
+		C(WSASYSNOTREADY                   )
+		C(WSAVERNOTSUPPORTED               )
+		C(WSANOTINITIALISED                )
+		C(WSAEDISCON                       )
+		C(WSAENOMORE                       )
+		C(WSAECANCELLED                    )
+		C(WSAEINVALIDPROCTABLE             )
+		C(WSAEINVALIDPROVIDER              )
+		C(WSAEPROVIDERFAILEDINIT           )
+		C(WSASYSCALLFAILURE                )
+		C(WSASERVICE_NOT_FOUND             )
+		C(WSATYPE_NOT_FOUND                )
+		C(WSA_E_NO_MORE                    )
+		C(WSA_E_CANCELLED                  )
+		C(WSAEREFUSED                      )
+		C(WSAHOST_NOT_FOUND                )
+		C(WSATRY_AGAIN                     )
+		C(WSANO_RECOVERY                   )
+		C(WSANO_DATA                       )
+		C(WSA_QOS_RECEIVERS                )
+		C(WSA_QOS_SENDERS                  )
+		C(WSA_QOS_NO_SENDERS               )
+		C(WSA_QOS_NO_RECEIVERS             )
+		C(WSA_QOS_REQUEST_CONFIRMED        )
+		C(WSA_QOS_ADMISSION_FAILURE        )
+		C(WSA_QOS_POLICY_FAILURE           )
+		C(WSA_QOS_BAD_STYLE                )
+		C(WSA_QOS_BAD_OBJECT               )
+		C(WSA_QOS_TRAFFIC_CTRL_ERROR       )
+		C(WSA_QOS_GENERIC_ERROR            )
+		C(WSA_QOS_ESERVICETYPE             )
+		C(WSA_QOS_EFLOWSPEC                )
+		C(WSA_QOS_EPROVSPECBUF             )
+		C(WSA_QOS_EFILTERSTYLE             )
+		C(WSA_QOS_EFILTERTYPE              )
+		C(WSA_QOS_EFILTERCOUNT             )
+		C(WSA_QOS_EOBJLENGTH               )
+		C(WSA_QOS_EFLOWCOUNT               )
+		C(WSA_QOS_EUNKOWNPSOBJ             )
+		C(WSA_QOS_EPOLICYOBJ               )
+		C(WSA_QOS_EFLOWDESC                )
+		C(WSA_QOS_EPSFLOWSPEC              )
+		C(WSA_QOS_EPSFILTERSPEC            )
+		C(WSA_QOS_ESDMODEOBJ               )
+		C(WSA_QOS_ESHAPERATEOBJ            )
+		C(WSA_QOS_RESERVED_PETYPE          )
+		C(WSA_SECURE_HOST_NOT_FOUND        )
+		C(WSA_IPSEC_NAME_POLICY_ERROR      )
+		default: print("unknown WSA error"); break;
+	}
+	print("\n");
+}
 
 FontCollection *font_collection;
 
@@ -45,6 +155,7 @@ HWND hwnd;
 IDXGISwapChain *swap_chain = 0;
 ID3D11Device *device = 0;
 ID3D11DeviceContext *immediate_context = 0;
+Mutex immediate_context_mutex;
 
 ID3D11RenderTargetView *back_buffer = 0;
 ID3D11DepthStencilView *depth_stencil = 0;
@@ -61,6 +172,7 @@ u32 const shadow_world_size = 256;
 ID3D11InfoQueue* debug_info_queue = 0;
 
 ID3D11RasterizerState *wireframe_rasterizer;
+ID3D11RasterizerState *no_cull_rasterizer;
 bool wireframe_rasterizer_enabled;
 
 ID3D11BlendState *alpha_blend;
@@ -88,7 +200,14 @@ ID3D11PixelShader  *font_ps = 0;
 ID3D11VertexShader *crosshair_vs = 0;
 ID3D11PixelShader  *crosshair_ps = 0;
 
+ID3D11GeometryShader *grass_gs = 0;
+ID3D11VertexShader   *grass_vs = 0;
+ID3D11PixelShader    *grass_ps = 0;
+
 ID3D11ShaderResourceView *font_vertex_buffer = 0;
+
+List<utf8> executable_path;
+Span<utf8> executable_directory;
 
 struct FontVertex {
 	v2f position;
@@ -118,11 +237,20 @@ struct StatValue {
 	}
 
 	T avg() { return count ? sum / count : T{}; }
+
+	StatValue operator*(T that) {
+		return {
+			.current = current * that,
+			.min     = min     * that,
+			.max     = max     * that,
+			.sum     = sum     * that,
+		};
+	}
 };
 
 template <class T>
 inline umm append(StringBuilder &builder, StatValue<T> stat) {
-	return append_format(builder, "{}|{}|{}|{}", stat.current, stat.min, stat.max, stat.avg());
+	return append_format(builder, "{} | {} | {} | {}", stat.current, stat.min, stat.max, stat.avg());
 }
 
 StatValue<f32> actual_fps;
@@ -136,17 +264,6 @@ struct alignas(16) FrameCbuffer {
 	f32 _;
 	v3f ldir;
 };
-#define FRAME_CBUFFER_STR R"(
-cbuffer _ : register(b0) {
-    float4x4 c_mvp;
-    float4x4 c_rotproj;
-	float4x4 light_vp_matrix;
-	float3 c_campos;
-	float _;
-	float3 c_ldir;
-}
-)"
-
 CBuffer<FrameCbuffer> frame_cbuffer;
 
 struct alignas(16) ChunkCbuffer {
@@ -158,12 +275,155 @@ struct alignas(16) ChunkCbuffer {
 CBuffer<ChunkCbuffer> chunk_cbuffer;
 
 
+#define HLSL_CBUFFER R"(
+cbuffer _ : register(b0) {
+    float4x4 c_mvp;
+    float4x4 c_rotproj;
+	float4x4 light_vp_matrix;
+	float3 c_campos;
+	float _;
+	float3 c_ldir;
+}
+cbuffer _ : register(b1) {
+    float3 c_relative_position;
+	float c_was_remeshed;
+    float3 c_actual_position;
+}
+)"
+
+#define HLSL_COMMON R"(
+#define X(t) \
+t pow2(t v){return v*v;} \
+t pow3(t v){return v*v*v;} \
+t pow4(t v){return pow2(v*v);} \
+t pow5(t v){return pow2(v*v)*v;}
+X(float)
+X(float2)
+X(float3)
+X(float4)
+#undef X
+
+float sdot(float3 a, float3 b) {
+	return max(0,dot(a,b));
+}
+
+#define X(t) \
+t map(t value, t source_min, t source_max, t dest_min, t dest_max) { \
+	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min; \
+}
+X(float)
+X(float2)
+X(float3)
+X(float4)
+#undef X
+
+#define X(t) \
+t map_clamped(t value, t source_min, t source_max, t dest_min, t dest_max) { \
+	return (clamp(value, source_min, source_max) - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min; \
+}
+X(float)
+X(float2)
+X(float3)
+X(float4)
+#undef X
+
+#define pi 3.1415926535897932384626433832795
+
+#define CHUNKW )" STRINGIZE(CHUNKW) R"(
+#define DRAWD )" STRINGIZE(DRAWD) R"(
+
+)"
+
+#define HLSL_LIGHTING R"(
+float trowbridge_reitz_ggx(float NH, float roughness) {
+	float r2 = pow2(roughness);
+	return r2 / (pi * pow2(pow2(NH)*(r2 - 1) + 1));
+}
+float schlick_ggx(float NV, float k) {
+	return NV / (NV * (1 - k) + k);
+}
+float k_direct(float roughness) {
+	return pow2(roughness + 1) * 0.125f;
+}
+float k_ibl(float roughness) {
+	return pow2(roughness) * 0.5f;
+}
+float smith_schlick(float NV, float NL, float k) {
+	return schlick_ggx(NV, k) * schlick_ggx(NL, k);
+}
+float3 fresnel_schlick(float cos_theta, float3 F0) {
+	return F0 + (1 - F0) * pow5(1 - cos_theta);
+}
+float3 cook_torrance(float D, float3 F, float G, float NV, float NL) {
+	return D * F * G / (pi * NV * NL);
+}
+
+
+float3 calculate_normal(float3 normal, float3 tangent, float3 tangent_space_normal)
+{
+	return normalize(
+		tangent_space_normal.x * tangent +
+		tangent_space_normal.y * cross(normal, tangent) +
+		tangent_space_normal.z * normal
+	);
+}
+float3 unpack_normal(float3 color, float scale) {
+	return map(
+		color,
+		0,
+		1,
+		float3(-scale,-scale,0),
+		float3(+scale,+scale,1)
+	);
+}
+)"
+
+#define HLSL_TRIPLANAR R"(
+float4 triplanar(Texture2D tex, SamplerState sam, float3 wpos, float3 normal) {
+	float4 pixel_color = 0;
+
+	float3 t = abs(normal);
+	// t = pow(t, 16);
+	t *= 1.0f / (t.x + t.y + t.z);
+
+	float2 u = wpos.zy * float2(+sign(normal.x), 1);
+	float2 v = wpos.xz * float2(+sign(normal.y), 1);
+	float2 w = wpos.xy * float2(-sign(normal.z), 1);
+
+	pixel_color += tex.Sample(sam, u) * t.x;
+	pixel_color += tex.Sample(sam, v) * t.y;
+	pixel_color += tex.Sample(sam, w) * t.z;
+
+	return pixel_color;
+}
+
+// I tried to make an overcomplicated mess as always and it didn't work.
+// So i'm using an algorithm described in here:
+// https://bgolus.medium.com/normal-mapping-for-a-triplanar-shader-10bf39dca05a
+// They are also describing different blending techniques, but i think this is already good enough.
+float3 triplanar_normal(Texture2D tex, SamplerState sam, float3 wpos, float3 normal) {
+	float3 t = abs(normal);
+	// t = pow(t, 16);
+	t *= 1.0f / (t.x + t.y + t.z);
+
+	float normal_scale = .5;
+	float3 nx = unpack_normal(tex.Sample(sam, wpos.zy).rgb, normal_scale);
+	float3 ny = unpack_normal(tex.Sample(sam, wpos.xz).rgb, normal_scale);
+	float3 nz = unpack_normal(tex.Sample(sam, wpos.xy).rgb, normal_scale);
+	nx.z *= sign(normal).x;
+	ny.z *= sign(normal).y;
+	nz.z *= sign(normal).z;
+
+	return normalize(nx.zyx * t.x + ny.xzy * t.y + nz.xyz * t.z);
+}
+)"
+
 Profiler profiler;
 bool profile_frame;
 
 f32 frame_time;
 f32 update_time;
-f32 generate_time;
+StatValue<f32> generate_time;
 
 ThreadPool thread_pool;
 
@@ -204,6 +464,8 @@ struct ChunkRelativePosition {
 		return (v3f)(chunk * CHUNKW) + local;
 	}
 };
+
+Optional<v3f> gradient_at(ChunkRelativePosition position);
 
 umm append(StringBuilder &builder, ChunkRelativePosition p) {
 	return append_format(builder, "{}+{}", p.chunk, p.local);
@@ -261,6 +523,7 @@ struct VertexBuffer {
 
 struct Chunk {
 	VertexBuffer vertex_buffers[6] = {};
+	VertexBuffer grass_vb = {};
 #if USE_INDICES
 	ID3D11Buffer *index_buffer = 0;
 #endif
@@ -276,6 +539,7 @@ struct Chunk {
 	bool sdf_generated = false;
 	bool mesh_generated = false;
 	bool was_modified = false;
+	bool has_surface = false;
 #if 0
 	Array<Array<Array<s8, CHUNKW>, CHUNKW>, CHUNKW> sdf;
 #else
@@ -359,27 +623,44 @@ NeighborMask get_neighbor_mask(v3s position) {
 	auto _110 = get_chunk(position + v3s{1,1,0}).sdf_generated;
 	auto _111 = get_chunk(position + v3s{1,1,1}).sdf_generated;
 
-	auto r = position != camera->position.chunk + DRAWD;
-
 	NeighborMask mask;
-	mask.x =
-		r.x &&
+
+	if (
 		_100 &&
-		_110 &&
-		_101 &&
-		_111;
-	mask.y =
-		r.y &&
 		_010 &&
-		_110 &&
-		_011 &&
-		_111;
-	mask.z =
-		r.z &&
 		_001 &&
-		_101 &&
 		_011 &&
-		_111;
+		_101 &&
+		_110 &&
+		_111
+	) mask = {.x=true,.y=true,.z=true};
+	else if (
+		_100 &&
+		_001 &&
+		_101
+	) mask = {.x=true,.z=true};
+
+	else if (
+		_100 &&
+		_010 &&
+		_110
+	) mask = {.x=true,.y=true};
+
+	else if (
+		_010 &&
+		_001 &&
+		_011
+	) mask = {.y=true,.z=true};
+
+	else if (_100) mask = {.x=true};
+	else if (_010) mask = {.y=true};
+	else if (_001) mask = {.z=true};
+	else mask = {};
+
+	auto r = position != camera->position.chunk + DRAWD;
+	mask.x &= r.x;
+	mask.y &= r.y;
+	mask.z &= r.z;
 	return mask;
 }
 
@@ -475,6 +756,7 @@ void generate_sdf(Chunk &chunk, v3s chunk_position) {
 		memset(chunk.sdf3, -128, sizeof chunk.sdf3);
 		memset(chunk.sdf4, -128, sizeof chunk.sdf4);
 		memset(chunk.sdf5, -128, sizeof chunk.sdf5);
+		chunk.has_surface = false;
 		return;
 	}
 
@@ -485,8 +767,11 @@ void generate_sdf(Chunk &chunk, v3s chunk_position) {
 		memset(chunk.sdf3, 127, sizeof chunk.sdf3);
 		memset(chunk.sdf4, 127, sizeof chunk.sdf4);
 		memset(chunk.sdf5, 127, sizeof chunk.sdf5);
+		chunk.has_surface = false;
 		return;
 	}
+
+	chunk.has_surface = true;
 
 	f32 sdf_max_abs = -1;
 	f32 sdf_max     = min_value<f32>;
@@ -645,6 +930,7 @@ void generate_sdf(Chunk &chunk, v3s chunk_position) {
 
 	if (sdf_max_abs == -1) {
 		sdf_max_abs = 1;
+		chunk.has_surface = false;
 	}
 	for (s32 x = 0; x < CHUNKW; ++x) {
 	for (s32 y = 0; y < CHUNKW; ++y) {
@@ -690,8 +976,92 @@ u64 get_hash(Chunk *const &chunk) {
 	return chunk - &chunks[0][0][0];
 }
 
-LinearSet<Chunk *> chunks_with_meshes;
-Mutex chunks_with_meshes_mutex;
+void generate_grass(Chunk &chunk, v3s chunk_position) {
+	struct Vertex {
+		v3f origin;
+		v3f position;
+		v3f normal;
+		v2f uv;
+	};
+	List<Vertex> vertices;
+	vertices.allocator = temporary_allocator;
+
+	xorshift32 rng{ get_performance_counter() };
+
+	auto put_grass = [&] (v3f position) {
+		auto normal = gradient_at(ChunkRelativePosition{.chunk=chunk_position, .local=position}).value_or({0,1,0});
+
+		f32 angle = next_f32(rng);
+
+		position += v3f {
+			next_f32(rng) - 0.5f,
+			0,
+			next_f32(rng) - 0.5f,
+		};
+
+		auto m = m2::rotation(angle * tau);
+
+		for (u32 i = 0; i < 3; ++i) {
+			Vertex _0 = {.origin = position, .position = position + V3f(m * v2f{-1,0},-0.5f).xzy(), .normal = normal, .uv = {0,1}};
+			Vertex _1 = {.origin = position, .position = position + V3f(m * v2f{-1,0},+1.5f).xzy(), .normal = normal, .uv = {0,0}};
+			Vertex _2 = {.origin = position, .position = position + V3f(m * v2f{+1,0},-0.5f).xzy(), .normal = normal, .uv = {1,1}};
+			Vertex _3 = {.origin = position, .position = position + V3f(m * v2f{+1,0},+1.5f).xzy(), .normal = normal, .uv = {1,0}};
+			vertices.add(_0);
+			vertices.add(_1);
+			vertices.add(_2);
+			vertices.add(_2);
+			vertices.add(_1);
+			vertices.add(_3);
+			m *= m2::rotation(tau / 3);
+		}
+	};
+
+	for (s32 x = 0; x < CHUNKW; ++x) {
+	for (s32 z = 0; z < CHUNKW; ++z) {
+		s8 prev = chunk.sdf0[x][CHUNKW-1][z];
+		for (s32 y = CHUNKW-2; y >= 0; --y) {
+			auto cur = chunk.sdf0[x][y][z];
+			if (cur > 0) {
+				if (prev <= 0) {
+					put_grass((v3f)v3s{x, y, z} + v3f{0,(f32)cur / (cur - prev),0});
+					break;
+				}
+			}
+			prev = cur;
+		}
+	}
+	}
+
+
+	chunk.grass_vb.vertex_count = vertices.count;
+
+	if (chunk.grass_vb.view) {
+		chunk.grass_vb.view->Release();
+		chunk.grass_vb.view = 0;
+	}
+
+	if (!chunk.grass_vb.vertex_count)
+		return;
+
+	ID3D11Buffer *resource;
+	defer { resource->Release(); };
+
+	{
+		D3D11_BUFFER_DESC desc {
+			.ByteWidth = (UINT)(sizeof(vertices[0]) * vertices.count),
+			.Usage = D3D11_USAGE_DEFAULT,
+			.BindFlags = D3D11_BIND_SHADER_RESOURCE,
+			.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+			.StructureByteStride = sizeof(vertices[0]),
+		};
+		D3D11_SUBRESOURCE_DATA init {
+			.pSysMem = vertices.data,
+		};
+		dhr(device->CreateBuffer(&desc, &init, &resource));
+	}
+	dhr(device->CreateShaderResourceView(resource, 0, &chunk.grass_vb.view));
+
+}
 
 template <u32 lodw>
 void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
@@ -993,9 +1363,13 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 #if 1
 	auto &vertex_buffer = chunk.vertex_buffers[lod_index].view;
 
-	ID3D11Buffer *buffer;
-	defer { buffer->Release(); };
+	ID3D11Buffer *resource;
+	defer { resource->Release(); };
 
+	if (vertex_buffer) {
+		vertex_buffer->Release();
+		vertex_buffer = 0;
+	}
 	{
 		D3D11_BUFFER_DESC desc {
 			.ByteWidth = (UINT)(sizeof(vertices[0]) * vertices.count),
@@ -1004,16 +1378,13 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 			.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
 			.StructureByteStride = sizeof(vertices[0]),
 		};
-
 		D3D11_SUBRESOURCE_DATA init {
 			.pSysMem = vertices.data,
 		};
+		dhr(device->CreateBuffer(&desc, &init, &resource));
+	}
+	dhr(device->CreateShaderResourceView(resource, 0, &vertex_buffer));
 
-		dhr(device->CreateBuffer(&desc, &init, &buffer));
-	}
-	{
-		dhr(device->CreateShaderResourceView(buffer, 0, &vertex_buffer));
-	}
 #endif
 
 #if USE_INDICES
@@ -1035,9 +1406,6 @@ void generate_chunk_lod(Chunk &chunk, v3s chunk_position) {
 #endif
 
 	chunk.time_since_remesh = 0;
-
-	scoped_lock(chunks_with_meshes_mutex);
-	chunks_with_meshes.insert(&chunk);
 }
 
 void update_chunk_mesh(Chunk &chunk, v3s chunk_position) {
@@ -1111,7 +1479,7 @@ s32 get_chunk_lod_index(v3s p) {
 
 void generate_chunks_around() {
 	auto generate_timer = create_precise_timer();
-	defer { generate_time = get_time(generate_timer); };
+	defer { generate_time.set(get_time(generate_timer)); };
 
 	timed_function(profiler, profile_frame);
 
@@ -1119,7 +1487,7 @@ void generate_chunks_around() {
 	s32 n_sdfs_generated = 0;
 
 	if (sdfs_generated_per_frame) {
-		auto avg = (f32)generate_time / sdfs_generated_per_frame;
+		auto avg = (f32)generate_time.current / sdfs_generated_per_frame;
 		if (smoothed_average_generation_time == 0) {
 			smoothed_average_generation_time = avg;
 		} else {
@@ -1128,12 +1496,12 @@ void generate_chunks_around() {
 		sdfs_generated_per_frame = 0;
 	}
 
+	// n_sdfs_can_generate_this_frame = 4;
+
 	n_sdfs_can_generate_this_frame =
 		smoothed_average_generation_time == 0 ?
 		thread_count :
 		max(thread_count, floor_to_int(available_time / smoothed_average_generation_time));
-
-	print("{}\n", n_sdfs_can_generate_this_frame);
 
 	auto work = make_work_queue(thread_pool);
 
@@ -1169,6 +1537,7 @@ void generate_chunks_around() {
 			}
 			chunk.indices_count = 0;
 #endif
+			chunk.has_surface = false;
 			chunk.sdf_generated = false;
 			chunk.neighbor_mask = {};
 
@@ -1176,8 +1545,6 @@ void generate_chunks_around() {
 				chunk.was_modified = false;
 				save_chunk(chunk, chunk_position);
 			}
-
-			find_and_erase_unordered(chunks_with_meshes, &chunk);
 		}
 		}
 		}
@@ -1223,17 +1590,23 @@ void generate_chunks_around() {
 				chunk.neighbor_mask = get_neighbor_mask(chunk_position);
 				if (auto found = saved_chunks.find(chunk_position)) {
 					work.push([chunk = &chunk, chunk_position, found]{
+						timed_block(profiler, profile_frame, "load saved chunk");
 						memcpy(chunk->sdf0, found->value.sdf, sizeof(chunk->sdf0));
 						filter_sdf(*chunk);
 						chunk->sdf_generated = true;
 						update_chunk_mesh(*chunk, chunk_position);
+						chunk->has_surface = true;
+						generate_grass(*chunk, chunk_position);
 					});
+					remesh_count++;
 				} else {
 					if (n_sdfs_generated < n_sdfs_can_generate_this_frame) {
 						n_sdfs_generated += 1;
 						work.push([chunk = &chunk, chunk_position]{
 							generate_sdf(*chunk, chunk_position);
 							update_chunk_mesh(*chunk, chunk_position);
+							if (chunk->has_surface)
+								generate_grass(*chunk, chunk_position);
 						});
 						remesh_count++;
 					}
@@ -1398,7 +1771,7 @@ void unlock_cursor() {
 }
 
 s32 brush_size = 8;
-ChunkRelativePosition cursor_position;
+ChunkRelativePosition opponent_position;
 
 void add_sdf_sphere(ChunkRelativePosition position, s32 radius, s32 strength) {
 	timed_function(profiler, profile_frame);
@@ -1580,7 +1953,150 @@ Optional<v3f> gradient_at(ChunkRelativePosition position) {
 
 s32 debug_selected_lod = -1;
 
+bool is_server;
+bool is_connected;
+bool another_thread_is_connected;
+bool opponent_received_chunks;
+bool world_transfer_ended;
+
+enum class NetMessageKind : u8 {
+	brush,
+	set_position,
+	set_chunk,
+	end_chunk_transfer,
+};
+
+// TODO: separate structs instead of everything in NetMessage,
+// Queue<u8> net_queue;
+
+#pragma pack(push, 1)
+struct NetMessage {
+	NetMessageKind kind;
+	union {
+		struct {
+			ChunkRelativePosition position;
+			s32 radius;
+			s32 strength;
+		} brush;
+		ChunkRelativePosition set_position;
+		struct {
+			v3s position;
+			s8 sdf[CHUNKW][CHUNKW][CHUNKW];
+		} set_chunk;
+		struct {} end_chunk_transfer;
+	};
+};
+#pragma pack(pop)
+
+Queue<NetMessage> net_queue;
+Mutex net_queue_mutex;
+net::Socket opponent_socket;
+
+void send_message(NetMessage const &message) {
+	if (!is_connected)
+		return;
+
+	bool success;
+	switch (message.kind) {
+		using enum NetMessageKind;
+#define C(x) case x: success = send_all(opponent_socket, Span((u8 *)&message, sizeof(message.x) + 1)); break;
+
+		C(brush)
+		C(set_position)
+		C(set_chunk)
+		C(end_chunk_transfer)
+
+#undef C
+		default: invalid_code_path();
+	}
+	if (!success) {
+		print("send failed\n");
+		print_wsa_error();
+	}
+}
+
+void add_sdf_sphere_synchronized(ChunkRelativePosition position, s32 brush_size, s32 strength) {
+	add_sdf_sphere(position, brush_size, strength);
+	send_message({
+		.kind = NetMessageKind::brush,
+		.brush = {
+			.position = position,
+			.radius = brush_size,
+			.strength = strength,
+		}
+	});
+}
+
+void draw_text(Span<utf8> str, u32 size, v2f position, bool ndc_position = false) {
+	auto font = get_font_at_size(font_collection, size);
+	ensure_all_chars_present(str, font);
+	auto placed_chars = place_text(str, font);
+
+	if (font_vertex_buffer) {
+		font_vertex_buffer->Release();
+		font_vertex_buffer = 0;
+	}
+	{
+		List<FontVertex> vertices;
+		vertices.allocator = temporary_allocator;
+
+		for (auto c : placed_chars) {
+			FontVertex face[] {
+				{{c.position.min.x, c.position.min.y}, {c.uv.min.x, c.uv.min.y}},
+				{{c.position.min.x, c.position.max.y}, {c.uv.min.x, c.uv.max.y}},
+				{{c.position.max.x, c.position.min.y}, {c.uv.max.x, c.uv.min.y}},
+				{{c.position.max.x, c.position.max.y}, {c.uv.max.x, c.uv.max.y}},
+			};
+
+			vertices.add(face[0]);
+			vertices.add(face[2]);
+			vertices.add(face[1]);
+			vertices.add(face[1]);
+			vertices.add(face[2]);
+			vertices.add(face[3]);
+		}
+		for (auto &v : vertices) {
+			if (ndc_position)
+				v.position = map(v.position, v2f{}, (v2f)window_client_size, v2f{0, 0}, v2f{2,-2}) + position;
+			else
+				v.position = map(v.position + position, v2f{}, (v2f)window_client_size, v2f{-1, 1}, v2f{1,-1});
+		}
+
+		ID3D11Buffer *vertex_buffer;
+		defer { vertex_buffer->Release(); };
+		{
+			D3D11_BUFFER_DESC desc {
+				.ByteWidth = (UINT)(sizeof(FontVertex) * vertices.count),
+				.Usage = D3D11_USAGE_DEFAULT,
+				.BindFlags = D3D11_BIND_SHADER_RESOURCE,
+				.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
+				.StructureByteStride = sizeof(vertices[0]),
+			};
+
+			D3D11_SUBRESOURCE_DATA init {
+				.pSysMem = vertices.data,
+			};
+
+			dhr(device->CreateBuffer(&desc, &init, &vertex_buffer));
+		}
+		{
+			dhr(device->CreateShaderResourceView(vertex_buffer, 0, &font_vertex_buffer));
+		}
+
+		immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		immediate_context->VSSetShaderResources(0, 1, &font_vertex_buffer);
+		immediate_context->PSSetShaderResources(0, 1, &font->texture);
+		immediate_context->VSSetShader(font_vs, 0, 0);
+		immediate_context->PSSetShader(font_ps, 0, 0);
+		immediate_context->OMSetBlendState(font_blend, {}, -1);
+
+		immediate_context->Draw(vertices.count, 0);
+	}
+}
+
 void update() {
+	is_connected = another_thread_is_connected;
+
 	auto update_timer = create_precise_timer();
 	defer { update_time = get_time(update_timer); };
 
@@ -1635,6 +2151,48 @@ void update() {
 		camera->position = camera->prev_position = {0,1,0};
 	}
 
+	auto collide_box = [&] (Entity &entity, v3f min, v3f max) {
+		v3f collision_points[] = {
+			{min.x,min.y,min.z},
+			{min.x,min.y,max.z},
+			{min.x,max.y,min.z},
+			{min.x,max.y,max.z},
+			{max.x,min.y,min.z},
+			{max.x,min.y,max.z},
+			{max.x,max.y,min.z},
+			{max.x,max.y,max.z},
+		};
+
+		bool fallback = false;
+		for (auto collision_point : collision_points) {
+			auto corner_pos = entity.position + collision_point;
+
+			s32 const iter_max = 256;
+
+			s32 i = 0;
+			for (i = 0; i < iter_max; ++i) {
+				if (auto sdf_ = sdf_at_interpolated(corner_pos)) {
+					auto sdf = sdf_.value_unchecked();
+					if (sdf < 0) {
+						break;
+					}
+					if (auto gradient = gradient_at(corner_pos)) {
+						corner_pos += gradient.value_unchecked() / iter_max;
+					} else {
+						corner_pos += v3f{0,frame_time,0};
+						fallback = true;
+					}
+				}
+			}
+			if (i == iter_max)
+				fallback = true;
+			entity.position = corner_pos - collision_point;
+		}
+
+		if (fallback)
+			entity.prev_position = entity.position;
+	};
+
 	for (auto entity_it = entities.begin(); entity_it != entities.end();) {
 		auto &entity = *entity_it;
 		switch (entity.kind) {
@@ -1675,50 +2233,7 @@ void update() {
 						f32 player_height = 1.8f;
 						f32 player_radius = .2f;
 
-						v3f collision_points[] = {
-							{-player_radius,-camera_height             ,-player_radius},
-							{ player_radius,-camera_height             ,-player_radius},
-							{-player_radius,-camera_height             , player_radius},
-							{ player_radius,-camera_height             , player_radius},
-							{-player_radius,player_height-camera_height,-player_radius},
-							{ player_radius,player_height-camera_height,-player_radius},
-							{-player_radius,player_height-camera_height, player_radius},
-							{ player_radius,player_height-camera_height, player_radius},
-						};
-
-						bool fallback = false;
-						for (auto collision_point : collision_points) {
-							auto corner_pos = camera->position + collision_point;
-
-							s32 const iter_max = 1024;
-
-							s32 i = 0;
-							for (i = 0; i < iter_max; ++i) {
-								if (auto sdf_ = sdf_at_interpolated(corner_pos)) {
-									auto sdf = sdf_.value_unchecked();
-									if (sdf < 0) {
-										break;
-									}
-									if (auto gradient = gradient_at(corner_pos)) {
-										corner_pos += gradient.value_unchecked() / iter_max;
-									} else {
-										//corner_pos = camera->prev_position-v3f{0,camera_height,0};
-										corner_pos += v3f{0,frame_time,0};
-										fallback = true;
-									}
-
-									//if (auto collision = global_raycast(corner_pos, (camera->prev_position, camera->position).to_v3f(), CHUNKW)) {
-									//	camera->position = collision.position + v3f{0,camera_height,0};
-									//}
-								}
-							}
-							if (i == iter_max)
-								fallback = true;
-							camera->position = corner_pos - collision_point;
-						}
-
-						if (fallback)
-							camera->prev_position = camera->position;
+						collide_box(*camera, {-player_radius, -camera_height, -player_radius}, {player_radius, player_height-camera_height, player_radius});
 
 						camera->position += m4::rotation_r_y(camera_angles.y) * camera_position_delta * v3f{1,0,1} * frame_time * (key_held(Key_shift) ? 2 : 1);
 						if (key_down(' '))
@@ -1736,28 +2251,16 @@ void update() {
 				auto velocity = (entity.position - entity.prev_position).to_v3f();
 
 				entity.prev_position = entity.position;
-				entity.position += velocity*.99 + v3f{0,-9.8f,0}*pow2(frame_time);
+				entity.position += velocity*.999 + v3f{0,-9.8f,0}*2*pow2(frame_time);
 
-				static v3f checkdir;
-
-				if (auto collision = global_raycast(entity.position, (entity.position-entity.prev_position).to_v3f(), CHUNKW)) {
-					if (collision.distance < 1) {
-						checkdir = collision.normal;
-					}
-				}
-
-				if (auto collision = global_raycast(entity.position, checkdir, CHUNKW)) {
-					if (collision.distance < 2) {
-						entity.position = collision.position;
-					}
-				}
+				collide_box(entity, {-1,-1,-1}, {1,1,1});
 
 				entity.grenade.timer -= frame_time;
 				if (entity.grenade.timer < 0) {
 					xorshift32 random { get_performance_counter() };
 
 					for (u32 i = 0; i < 8; ++i) {
-						add_sdf_sphere(entity.position + (next_v3f(random) * 8 - 4), map<f32>(next_f32(random), 0, 1, 4, 8), -256);
+						add_sdf_sphere_synchronized(entity.position + (next_v3f(random) * 8 - 4), map<f32>(next_f32(random), 0, 1, 4, 8), -256);
 					}
 
 					auto to_erase = entity_it;
@@ -1772,7 +2275,22 @@ void update() {
 		}
 		++entity_it;
 	}
+#if 0
+	if (is_server && is_connected && !opponent_received_chunks) {
+		opponent_received_chunks = true;
 
+		for (auto &[position, chunk] : saved_chunks) {
+			NetMessage message;
+			message.kind = NetMessageKind::set_chunk,
+			message.set_chunk.position = position,
+			memcpy(message.set_chunk.sdf, chunk.sdf, sizeof(chunk.sdf));
+			send_message(message);
+			print("sent chunk {}\n", position);
+		}
+		send_message({.kind = NetMessageKind::end_chunk_transfer});
+		print("sent end_chunk_transfer\n");
+	}
+#endif
 
 	auto rotproj = m4::perspective_left_handed((f32)window_client_size.x / window_client_size.y, radians(camera_fov), 0.1, CHUNKW * DRAWD) * m4::rotation_r_yxz(-camera_angles);
 	auto camera_matrix = rotproj * m4::translation(-camera->position.local);
@@ -1783,13 +2301,77 @@ void update() {
 	// 	chunk.time_since_remesh += frame_time;
 	// });
 
+	struct BrushStroke {
+		ChunkRelativePosition position;
+		s32 radius;
+		s32 strength;
+	};
+	List<BrushStroke> opponent_brush;
+	opponent_brush.allocator = temporary_allocator;
+
+	{
+		while (auto maybe_message = with(net_queue_mutex, net_queue.pop())) {
+			auto message = maybe_message.value_unchecked();
+			switch (message.kind) {
+				using enum NetMessageKind;
+				case brush:
+					print("brush: ");
+					print("position: {} ", message.brush.position);
+					print("radius: {} ", message.brush.radius);
+					print("strength: {} ", message.brush.strength);
+					print("\n");
+					if (message.brush.radius > CHUNKW) {
+						print("bad radius!\n");
+						break;
+					}
+
+					opponent_brush.add({
+						.position = message.brush.position,
+						.radius   = message.brush.radius,
+						.strength = message.brush.strength,
+					});
+					break;
+				case set_position:
+					opponent_position = message.set_position;
+					break;
+				case set_chunk: {
+					auto &chunk = saved_chunks.get_or_insert(message.set_chunk.position);
+					memcpy(chunk.sdf, message.set_chunk.sdf, sizeof(chunk.sdf));
+					print("received chunk {}\n", message.set_chunk.position);
+					break;
+				}
+				case end_chunk_transfer:
+					world_transfer_ended = true;
+					print("received end_chunk_transfer\n");
+					break;
+				default:
+					print("bad message! {}\n", (u8)message.kind);
+					break;
+			}
+		}
+	}
+#if 0
+	if (!is_server && !world_transfer_ended)
+		return;
+#endif
+
+	send_message({
+		.kind = NetMessageKind::set_position,
+		.set_position = camera->position,
+	});
+
 	generate_chunks_around();
 
 	auto camera_forward = camera_rotation * v3f{0,0,1};
 
+	for (auto brush : opponent_brush) {
+		add_sdf_sphere(brush.position, brush.radius, brush.strength);
+	}
 	if (mouse_held(0) || mouse_held(1)) {
 		if (auto hit = global_raycast(camera->position, camera_forward, CHUNKW*2)) {
-			add_sdf_sphere(hit.position + camera_forward * (brush_size - 1.5) * (mouse_held(0) ? 1 : -1), brush_size, brush_size * 32 * (mouse_held(0) ? 1 : -1));
+			auto position = hit.position + camera_forward * (brush_size - 1.5) * (mouse_held(0) ? 1 : -1);
+			auto strength = brush_size * 32 * (mouse_held(0) ? 1 : -1);
+			add_sdf_sphere_synchronized(position, brush_size, strength);
 		}
 	}
 
@@ -1889,6 +2471,8 @@ void update() {
 		immediate_context->VSSetShader(shadow_vs, 0, 0);
 		immediate_context->PSSetShader(shadow_ps, 0, 0);
 		immediate_context->RSSetState(0);
+		ID3D11ShaderResourceView *null = 0;
+		immediate_context->PSSetShaderResources(3, 1, &null);
 		immediate_context->OMSetRenderTargets(1, &shadow_rtv, shadow_dsv);
 		immediate_context->OMSetBlendState(0, {}, -1);
 		immediate_context->ClearRenderTargetView(shadow_rtv, v4f{}.s);
@@ -1947,6 +2531,8 @@ void update() {
 
 		immediate_context->VSSetShader(sky_vs, 0, 0);
 		immediate_context->PSSetShader(sky_ps, 0, 0);
+		ID3D11ShaderResourceView *null = 0;
+		immediate_context->PSSetShaderResources(1, 1, &null);
 		immediate_context->OMSetRenderTargets(1, &sky_rt, 0);
 		immediate_context->Draw(36, 0);
 
@@ -1968,16 +2554,17 @@ void update() {
 	}
 
 	//
-	// CHUNKS
+	// CHUNKS MESH
 	//
 	{
-		timed_block(profiler, profile_frame, "draw chunks");
+		timed_block(profiler, profile_frame, "draw chunks mesh");
 		immediate_context->OMSetRenderTargets(1, &back_buffer, depth_stencil);
 		immediate_context->VSSetShader(chunk_vs, 0, 0);
 		immediate_context->PSSetShader(chunk_solid_ps, 0, 0);
 
 		for (auto &chunk : flatten(chunks)) {
 			auto chunk_position = get_chunk_position(&chunk);
+
 			auto &vertex_buffer = chunk.vertex_buffers[debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod];
 			if (vertex_buffer.view) {
 				timed_block(profiler, profile_frame, "draw chunk");
@@ -1985,9 +2572,11 @@ void update() {
 					auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
 					chunk_cbuffer.update({
 						.relative_position = relative_position,
-						// .was_remeshed = (f32)(chunk.time_since_remesh < 0.1f),
+						.was_remeshed = (f32)(chunk.time_since_remesh <= frame_time),
 						.actual_position = (v3f)(chunk_position*CHUNKW),
 					});
+
+					chunk.time_since_remesh += frame_time;
 
 					immediate_context->VSSetShaderResources(0, 1, &vertex_buffer.view);
 #if USE_INDICES
@@ -2000,6 +2589,43 @@ void update() {
 			}
 		}
 	}
+
+	//
+	// CHUNKS GRASS
+	//
+	{
+		timed_block(profiler, profile_frame, "draw chunks grass");
+		immediate_context->RSSetState(no_cull_rasterizer);
+		immediate_context->VSSetShader(grass_vs, 0, 0);
+		immediate_context->PSSetShader(grass_ps, 0, 0);
+
+		for (auto &chunk : flatten(chunks)) {
+			auto chunk_position = get_chunk_position(&chunk);
+			auto lod_index = get_chunk_lod_index(chunk_position);
+			if (lod_index == 0) {
+				if (chunk.grass_vb.view) {
+					timed_block(profiler, profile_frame, "draw chunk grass");
+					if (chunk_in_view(chunk_position)) {
+						auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
+						chunk_cbuffer.update({
+							.relative_position = relative_position,
+							.actual_position = (v3f)(chunk_position*CHUNKW),
+						});
+
+						immediate_context->VSSetShaderResources(0, 1, &chunk.grass_vb.view);
+#if USE_INDICES
+						immediate_context->IASetIndexBuffer(chunk.index_buffer, DXGI_FORMAT_R32_UINT, 0);
+						immediate_context->DrawIndexed(chunk.indices_count, 0, 0);
+#else
+						immediate_context->Draw(chunk.grass_vb.vertex_count, 0);
+#endif
+					}
+				}
+			}
+		}
+	}
+
+	immediate_context->RSSetState(0);
 
 	if (key_down('R'))
 		wireframe_rasterizer_enabled = !wireframe_rasterizer_enabled;
@@ -2032,7 +2658,7 @@ void update() {
 		}
 	}
 
-	immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+	immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	immediate_context->VSSetShader(cursor_vs, 0, 0);
 	immediate_context->PSSetShader(cursor_ps, 0, 0);
 
@@ -2040,10 +2666,10 @@ void update() {
 		chunk_cbuffer.update({
 			.relative_position = position.local + (v3f)((position.chunk-camera->position.chunk)*CHUNKW),
 		});
-		immediate_context->Draw(6, 0);
+		immediate_context->Draw(36, 0);
 	};
 
-	draw_cursor(cursor_position);
+	draw_cursor(opponent_position);
 
 	for (auto &entity : entities) {
 		if (entity.kind == EntityKind::grenade) {
@@ -2051,6 +2677,7 @@ void update() {
 		}
 	}
 
+	immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
 	immediate_context->RSSetState(0);
 	immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
 	immediate_context->VSSetShader(crosshair_vs, 0, 0);
@@ -2061,6 +2688,8 @@ void update() {
 	{
 		timed_block(profiler, profile_frame, "ui");
 		StringBuilder builder;
+		builder.allocator = temporary_allocator;
+
 		append_format(builder, u8R"(fly/walk - F; sculpt - left/right mouse; brush size - 1/2; reset position - H; grenade - middle mouse;
 fps: {}
 brush_size: {}
@@ -2086,6 +2715,8 @@ n_sdfs_can_generate_this_frame,
 remesh_count
 );
 		HashMap<Span<utf8>, u64> time_spans;
+		time_spans.allocator = temporary_allocator;
+
 		for (auto &span : profiler.recorded_time_spans) {
 			time_spans.get_or_insert(span.name) += span.end - span.begin;
 		}
@@ -2093,70 +2724,28 @@ remesh_count
 			append_format(builder, "  {} {}us\n", name, duration * 1'000'000 / performance_frequency);
 		});
 
-		auto str = (Span<utf8>)to_string(builder);
+		draw_text((Span<utf8>)to_string(builder), 16, {});
+	}
+#if 0
+	for (auto &chunk : flatten(chunks)) {
+		auto chunk_position = get_chunk_position(&chunk);
+		auto &vertex_buffer = chunk.vertex_buffers[debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod];
+		if (vertex_buffer.view) {
+			timed_block(profiler, profile_frame, "draw chunk");
+			if (chunk_in_view(chunk_position)) {
+				auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
 
-		auto font = get_font_at_size(font_collection, 24);
-		ensure_all_chars_present(str, font);
-		auto placed_chars = place_text(str, font);
-
-		if (font_vertex_buffer) {
-			font_vertex_buffer->Release();
-			font_vertex_buffer = 0;
-		}
-		{
-			List<FontVertex> vertices;
-			defer { free(vertices); };
-
-			for (auto c : placed_chars) {
-				FontVertex face[] {
-					{{c.position.min.x, c.position.min.y}, {c.uv.min.x, c.uv.min.y}},
-					{{c.position.min.x, c.position.max.y}, {c.uv.min.x, c.uv.max.y}},
-					{{c.position.max.x, c.position.min.y}, {c.uv.max.x, c.uv.min.y}},
-					{{c.position.max.x, c.position.max.y}, {c.uv.max.x, c.uv.max.y}},
-				};
-
-				vertices.add(face[0]);
-				vertices.add(face[2]);
-				vertices.add(face[1]);
-				vertices.add(face[1]);
-				vertices.add(face[2]);
-				vertices.add(face[3]);
+				v4f p = camera_matrix * V4f(relative_position, 1);
+				if (p.z >= 0) {
+					p.xyz /= p.w;
+					draw_text(to_string(
+						FormatInt{.value=(chunk.neighbor_mask.x << 2) | (chunk.neighbor_mask.y << 1) | (chunk.neighbor_mask.z << 0), .radix=2,.leading_zero_count=3}
+					), 16, p.xy, true);
+				}
 			}
-			for (auto &v : vertices) {
-				v.position = map(v.position, v2f{}, (v2f)window_client_size, v2f{-1, 1}, v2f{1,-1});
-			}
-
-			ID3D11Buffer *vertex_buffer;
-			defer { vertex_buffer->Release(); };
-			{
-				D3D11_BUFFER_DESC desc {
-					.ByteWidth = (UINT)(sizeof(FontVertex) * vertices.count),
-					.Usage = D3D11_USAGE_DEFAULT,
-					.BindFlags = D3D11_BIND_SHADER_RESOURCE,
-					.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED,
-					.StructureByteStride = sizeof(vertices[0]),
-				};
-
-				D3D11_SUBRESOURCE_DATA init {
-					.pSysMem = vertices.data,
-				};
-
-				dhr(device->CreateBuffer(&desc, &init, &vertex_buffer));
-			}
-			{
-				dhr(device->CreateShaderResourceView(vertex_buffer, 0, &font_vertex_buffer));
-			}
-
-			immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-			immediate_context->VSSetShaderResources(0, 1, &font_vertex_buffer);
-			immediate_context->PSSetShaderResources(0, 1, &font->texture);
-			immediate_context->VSSetShader(font_vs, 0, 0);
-			immediate_context->PSSetShader(font_ps, 0, 0);
-			immediate_context->OMSetBlendState(font_blend, {}, -1);
-
-			immediate_context->Draw(vertices.count, 0);
 		}
 	}
+#endif
 }
 void resize() {
 	if (swap_chain) {
@@ -2295,13 +2884,7 @@ LRESULT WINAPI wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			dhr(D3D11CreateDeviceAndSwapChain(0, D3D_DRIVER_TYPE_HARDWARE, 0, D3D11_CREATE_DEVICE_DEBUG, &feature, 1, D3D11_SDK_VERSION, &sd, &swap_chain, &device, 0, &immediate_context));
 			dhr(device->QueryInterface(&debug_info_queue));
 
-			chunk_vs = create_vs(FRAME_CBUFFER_STR R"(
-cbuffer _ : register(b1) {
-    float3 c_relative_position;
-	float c_was_remeshed;
-    float3 c_actual_position;
-}
-
+			chunk_vs = create_vs(HLSL_CBUFFER R"(
 struct Vertex {
 	float3 position;
 	float3 normal;
@@ -2337,7 +2920,7 @@ void main(
 		color = 1;
 #endif
 	} else {
-		color = float3(1,0,0);
+		color = float3(0,0,1);
 	}
 
 	position = mul(c_mvp, float4(pos, 1.0f));
@@ -2347,124 +2930,13 @@ void main(
 }
 )"s);
 
-			chunk_solid_ps = create_ps(FRAME_CBUFFER_STR R"(
+			chunk_solid_ps = create_ps(HLSL_CBUFFER HLSL_COMMON HLSL_LIGHTING HLSL_TRIPLANAR R"(
 SamplerState sam : register(s0);
 SamplerComparisonState dsam : register(s1);
 Texture2D skytex : register(t1);
 Texture2D vorotex : register(t2);
 Texture2D shadowtex : register(t3);
 Texture2D normtex : register(t4);
-
-#define pow(t) \
-t pow2(t v){return v*v;} \
-t pow3(t v){return v*v*v;} \
-t pow4(t v){return pow2(v*v);} \
-t pow5(t v){return pow2(v*v)*v;}
-pow(float)
-pow(float2)
-pow(float3)
-pow(float4)
-#undef pow
-
-#define pi 3.1415926535897932384626433832795
-
-float sdot(float3 a, float3 b) {
-	return max(0,dot(a,b));
-}
-
-float map(float value, float source_min, float source_max, float dest_min, float dest_max) {
-	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min;
-}
-float2 map(float2 value, float2 source_min, float2 source_max, float2 dest_min, float2 dest_max) {
-	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min;
-}
-float3 map(float3 value, float3 source_min, float3 source_max, float3 dest_min, float3 dest_max) {
-	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min;
-}
-float map_clamped(float value, float source_min, float source_max, float dest_min, float dest_max) {
-	return map(clamp(value, source_min, source_max), source_min, source_max, dest_min, dest_max);
-}
-float trowbridge_reitz_ggx(float NH, float roughness) {
-	float r2 = pow2(roughness);
-	return r2 / (pi * pow2(pow2(NH)*(r2 - 1) + 1));
-}
-float schlick_ggx(float NV, float k) {
-	return NV / (NV * (1 - k) + k);
-}
-float k_direct(float roughness) {
-	return pow2(roughness + 1) * 0.125f;
-}
-float k_ibl(float roughness) {
-	return pow2(roughness) * 0.5f;
-}
-float smith_schlick(float NV, float NL, float k) {
-	return schlick_ggx(NV, k) * schlick_ggx(NL, k);
-}
-float3 fresnel_schlick(float cos_theta, float3 F0) {
-	return F0 + (1 - F0) * pow5(1 - cos_theta);
-}
-float3 cook_torrance(float D, float3 F, float G, float NV, float NL) {
-	return D * F * G / (pi * NV * NL);
-}
-
-
-float4 triplanar(Texture2D tex, SamplerState sam, float3 wpos, float3 normal) {
-	float4 pixel_color = 0;
-
-	float3 t = abs(normal);
-	// t = pow(t, 16);
-	t *= 1.0f / (t.x + t.y + t.z);
-
-	float2 u = wpos.zy * float2(+sign(normal.x), 1);
-	float2 v = wpos.xz * float2(+sign(normal.y), 1);
-	float2 w = wpos.xy * float2(-sign(normal.z), 1);
-
-	pixel_color += tex.Sample(sam, u) * t.x;
-	pixel_color += tex.Sample(sam, v) * t.y;
-	pixel_color += tex.Sample(sam, w) * t.z;
-
-	return pixel_color;
-}
-
-float3 calculate_normal(float3 normal, float3 tangent, float3 tangent_space_normal)
-{
-   tangent_space_normal.xy *= -1;
-   float3 bitangent = cross(normal, tangent);
-   return normalize(
-      tangent_space_normal.x * tangent +
-      tangent_space_normal.y * bitangent +
-      tangent_space_normal.z * normal
-   );
-}
-float3 unpack_normal(float3 color, float scale) {
-	return normalize(map(
-		color,
-		0,
-		1,
-		float3(-scale,-scale,0),
-		float3(+scale,+scale,1)
-	));
-}
-
-// I tried to make an overcomplicated mess as always and it didn't work.
-// So i'm using an algorithm described in here:
-// https://bgolus.medium.com/normal-mapping-for-a-triplanar-shader-10bf39dca05a
-// They are also describing different blending techniques, but i think this is already good enough.
-float3 triplanar_normal(Texture2D tex, SamplerState sam, float3 wpos, float3 normal) {
-	float3 t = abs(normal);
-	// t = pow(t, 16);
-	t *= 1.0f / (t.x + t.y + t.z);
-
-	float normal_scale = .5;
-	float3 nx = unpack_normal(tex.Sample(sam, wpos.zy).rgb, normal_scale);
-	float3 ny = unpack_normal(tex.Sample(sam, wpos.xz).rgb, normal_scale);
-	float3 nz = unpack_normal(tex.Sample(sam, wpos.xy).rgb, normal_scale);
-	nx.z *= sign(normal).x;
-	ny.z *= sign(normal).y;
-	nz.z *= sign(normal).z;
-
-	return normalize(nx.zyx * t.x + ny.xzy * t.y + nz.xyz * t.z);
-}
 
 void main(
 	in float3 normal : NORMAL,
@@ -2533,7 +3005,7 @@ void main(
 	float fog = min(1, length(view) / ()" STRINGIZE(CHUNKW*DRAWD) R"());
 	fog *= fog;
 	fog *= fog;
-	pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
+	//pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
 
 	//pixel_color = shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01);
 	//pixel_color = shadowtex.Sample(sam, shadow_map_uv.xy);
@@ -2549,39 +3021,60 @@ void main(in float3 normal : NORMAL, in float3 color : COLOR, out float4 pixel_c
 }
 )"s);
 
-			cursor_vs = create_vs(R"(
-cbuffer _ : register(b0) {
-    float4x4 c_mvp;
-    float4x4 c_rotproj;
-	float3 c_campos;
-}
-
-cbuffer _ : register(b1) {
-    float3 c_relative_position;
-	float _;
-    float3 c_actual_position;
-}
-
+			cursor_vs = create_vs(HLSL_CBUFFER R"(
 void main(in uint vertex_id : SV_VertexID, out float3 color : COLOR, out float4 position : SV_Position) {
 	float3 positions[] = {
-		{-1, 0, 0},
-		{ 1, 0, 0},
-		{ 0,-1, 0},
-		{ 0, 1, 0},
-		{ 0, 0,-1},
-		{ 0, 0, 1},
-	};
-	float3 colors[] = {
-		{ 1, 0, 0},
-		{ 1, 0, 0},
-		{ 0, 1, 0},
-		{ 0, 1, 0},
-		{ 0, 0, 1},
-		{ 0, 0, 1},
+		// front
+		{-1, 1, 1},
+		{-1,-1, 1},
+		{ 1,-1, 1},
+		{ 1, 1, 1},
+		{-1, 1, 1},
+		{ 1,-1, 1},
+
+		// back
+		{-1,-1,-1},
+		{-1, 1,-1},
+		{ 1,-1,-1},
+		{-1, 1,-1},
+		{ 1, 1,-1},
+		{ 1,-1,-1},
+
+		// right
+		{ 1,-1, 1},
+		{ 1,-1,-1},
+		{ 1, 1,-1},
+		{ 1, 1, 1},
+		{ 1,-1, 1},
+		{ 1, 1,-1},
+
+		// left
+		{-1,-1,-1},
+		{-1,-1, 1},
+		{-1, 1,-1},
+		{-1,-1, 1},
+		{-1, 1, 1},
+		{-1, 1,-1},
+
+		// top
+		{-1, 1,-1},
+		{-1, 1, 1},
+		{ 1, 1,-1},
+		{-1, 1, 1},
+		{ 1, 1, 1},
+		{ 1, 1,-1},
+
+		// bottom
+		{-1,-1, 1},
+		{-1,-1,-1},
+		{ 1,-1,-1},
+		{ 1,-1, 1},
+		{-1,-1, 1},
+		{ 1,-1,-1},
 	};
 
 	position = mul(c_mvp, float4(positions[vertex_id]+c_relative_position, 1.0f));
-	color = colors[vertex_id];
+	color = positions[vertex_id];
 }
 )"s);
 			cursor_ps = create_ps(R"(
@@ -2590,13 +3083,7 @@ void main(in float3 color: COLOR, out float4 pixel_color : SV_Target) {
 }
 )"s);
 
-			sky_vs = create_vs(R"(
-cbuffer _ : register(b0) {
-    float4x4 c_mvp;
-    float4x4 c_rotproj;
-	float3 c_campos;
-}
-
+			sky_vs = create_vs(HLSL_CBUFFER R"(
 void main(in uint vertex_id : SV_VertexID, out float3 view : VIEW, out float4 position : SV_Position) {
 	float3 positions[] = {
 		// front
@@ -2651,7 +3138,7 @@ void main(in uint vertex_id : SV_VertexID, out float3 view : VIEW, out float4 po
 	position = mul(c_rotproj, float4(positions[vertex_id], 1));
 }
 )"s);
-			sky_ps = create_ps(FRAME_CBUFFER_STR R"(
+			sky_ps = create_ps(HLSL_CBUFFER R"(
 void main(in float3 view : VIEW, out float4 pixel_color : SV_Target) {
 	float3 L = c_ldir;
 	float3 V = normalize(view);
@@ -2684,13 +3171,7 @@ void main(in float2 uv : UV, out float4 pixel_color : SV_Target) {
 }
 )"s);
 
-			shadow_vs = create_vs(FRAME_CBUFFER_STR R"(
-cbuffer _ : register(b1) {
-    float3 c_relative_position;
-	float c_was_remeshed;
-    float3 c_actual_position;
-}
-
+			shadow_vs = create_vs(HLSL_CBUFFER R"(
 struct Vertex {
 	float3 position;
 	float3 normal;
@@ -2709,11 +3190,7 @@ void main(
 }
 )"s);
 
-			shadow_ps = create_ps(FRAME_CBUFFER_STR R"(
-float map(float value, float source_min, float source_max, float dest_min, float dest_max) {
-	return (value - source_min) / (source_max - source_min) * (dest_max - dest_min) + dest_min;
-}
-
+			shadow_ps = create_ps(HLSL_CBUFFER HLSL_COMMON R"(
 void main(
 	in float4 screen_uv : SCREEN_UV,
 	out float4 pixel_color : SV_Target
@@ -2767,6 +3244,120 @@ void main(out float4 pixel_color : SV_Target) {
 }
 )"s);
 
+			grass_vs = create_vs(HLSL_CBUFFER R"(
+struct Vertex {
+	float3 origin;
+	float3 position;
+	float3 normal;
+	float2 uv;
+};
+
+StructuredBuffer<Vertex> s_vertex_buffer : register(t0);
+
+void main(
+	in uint vertex_id : SV_VertexID,
+
+	out float2 uv : UV,
+	out float3 normal : NORMAL,
+	out float3 wpos : WPOS,
+	out float3 view : VIEW,
+	out float4 screen_uv : SCREEN_UV,
+	out float4 shadow_map_uv : SHADOW_MAP_UV,
+	out float4 position : SV_Position
+) {
+	Vertex v = s_vertex_buffer[vertex_id];
+	float3 pos = lerp(v.position, v.origin, distance(c_campos, v.origin)/CHUNKW) + c_relative_position;
+
+
+	wpos = pos/8;
+	uv = v.uv;
+	normal = v.normal;
+	view = pos - c_campos;
+
+	position = mul(c_mvp, float4(pos, 1.0f));
+	screen_uv = position * float4(1, -1, 1, 1);
+
+	shadow_map_uv = mul(light_vp_matrix, float4(pos, 1));
+}
+)"s);
+
+			grass_ps = create_ps(HLSL_CBUFFER HLSL_COMMON HLSL_LIGHTING HLSL_TRIPLANAR R"(
+SamplerState sam : register(s0);
+Texture2D tex : register(t5);
+
+SamplerComparisonState dsam : register(s1);
+Texture2D skytex : register(t1);
+Texture2D shadowtex : register(t3);
+
+void main(
+	in float3 uv : UV,
+	in float3 normal : NORMAL,
+	in float3 wpos : WPOS,
+	in float3 view : VIEW,
+	in float4 screen_uv : SCREEN_UV,
+	in float4 shadow_map_uv : SHADOW_MAP_UV,
+
+	out float4 pixel_color : SV_Target
+) {
+	float4 colortex = tex.Sample(sam, uv);
+
+	clip(colortex.a-0.5f);
+
+	float3 albedo = colortex.rgb * float3(.6,.9,.3);
+
+
+	float3 L = c_ldir;
+	float3 N = normal;
+
+	float3 V = -normalize(view);
+	float3 H = normalize(V + L);
+
+	float NV = max(dot(N, V), 1e-3f);
+	float NL = max(dot(N, L), 1e-3f);
+	float NH = max(dot(N, H), 1e-3f);
+	float VH = max(dot(V, H), 1e-3f);
+
+	float metalness = 0;
+	float roughness = .5;
+
+	screen_uv = (screen_uv / screen_uv.w) * 0.5 + 0.5;
+	float3 ambient_color = skytex.Sample(sam, screen_uv.xy);
+
+	float3 F0 = 0.04;
+	F0 = lerp(F0, albedo, metalness);
+
+	float D = trowbridge_reitz_ggx(NH, roughness);
+	float G = smith_schlick(NV, NL, k_direct(roughness));
+	float3 F = fresnel_schlick(NV, F0);
+	float3 specular = cook_torrance(D, F, G, NV, NL);
+	float3 diffuse = albedo * NL * (1 - metalness) / pi * (1 - specular);
+
+	float3 ambient_specular = ambient_color * F * smith_schlick(NV, 1, k_ibl(roughness));
+	float3 ambient_diffuse = albedo * ambient_color * (1-ambient_specular);
+	float3 ambient = ambient_diffuse / pi + ambient_specular;
+
+
+	shadow_map_uv /= shadow_map_uv.w;
+	shadow_map_uv.y *= -1;
+	float shadow_mask = saturate(map(length(shadow_map_uv.xyz), 0.9, 1, 0, 1));
+	shadow_map_uv = shadow_map_uv * 0.5 + 0.5;
+
+	float lightness = lerp(shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.003).x, 1, shadow_mask);
+	pixel_color.rgb = ambient + (diffuse + specular) * lightness;
+	pixel_color.a = 1;
+
+	float fog = min(1, length(view) / (CHUNKW*DRAWD));
+	fog *= fog;
+	fog *= fog;
+	//pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
+
+	//pixel_color = shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01);
+	//pixel_color = shadowtex.Sample(sam, shadow_map_uv.xy);
+
+}
+)"s);
+
+
 			frame_cbuffer.init();
 			chunk_cbuffer.init();
 
@@ -2811,6 +3402,13 @@ void main(out float4 pixel_color : SV_Target) {
 					.DepthBias = -32,
 				};
 				dhr(device->CreateRasterizerState(&desc, &wireframe_rasterizer));
+			}
+			{
+				D3D11_RASTERIZER_DESC desc {
+					.FillMode = D3D11_FILL_SOLID,
+					.CullMode = D3D11_CULL_NONE,
+				};
+				dhr(device->CreateRasterizerState(&desc, &no_cull_rasterizer));
 			}
 
 			{
@@ -2930,6 +3528,13 @@ void main(out float4 pixel_color : SV_Target) {
 				immediate_context->PSSetShaderResources(4, 1, &normal_texture);
 			}
 			{
+				int w,h;
+				auto pixels = stbi_load(tformat("{}\\grass.png\0"s, executable_directory).data, &w, &h, 0, 4);
+
+				auto grass_texture = make_texture(pixels, w, h);
+				immediate_context->PSSetShaderResources(5, 1, &grass_texture);
+			}
+			{
 				ID3D11Texture2D *tex;
 				{
 					D3D11_TEXTURE2D_DESC desc {
@@ -3019,6 +3624,10 @@ void main(out float4 pixel_color : SV_Target) {
 			resize();
 			return 0;
 		}
+		case WM_KILLFOCUS: {
+			unlock_cursor();
+			return 0;
+		}
 	}
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -3040,9 +3649,6 @@ auto on_mouse_down = [](u8 button){
 auto on_mouse_up = [](u8 button){
 	key_state[256 + button] = KeyState_up;
 };
-
-List<utf8> executable_path;
-Span<utf8> executable_directory;
 
 template <class Write>
 void encode_int32_multibyte(u32 x, Write &&write) requires requires { write((u8)0); } {
@@ -3066,8 +3672,73 @@ u32 decode_int32_multibyte(Read &&read) requires requires { (u8)read(); } {
 	return v;
 }
 
+void receive_loop() {
+	another_thread_is_connected = true;
+	defer { another_thread_is_connected = false; };
+	defer { print("exited receive loop\n"); };
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
+	StaticRingQueue<u8, 1*MiB> queue;
+	u8 buf[queue.capacity];
+
+	try {
+		while (1) {
+			auto read = [&]<class T>(T &v) {
+				u32 iters = 0;
+				while (queue.count < sizeof(T)) {
+					auto received_bytes = net::receive(opponent_socket, buf, queue.capacity - queue.count);
+					if (received_bytes == -1) {
+						print("client disconnected badly\n");
+						print_wsa_error();
+						throw 0;
+					}
+					if (received_bytes == 0) {
+						if (iters == 256) {
+							print("network error: not enough data\n");
+							throw 1;
+						}
+						iters++;
+						Sleep(1);
+					} else {
+						queue.push(Span(buf, received_bytes));
+					}
+				}
+
+				auto p = (u8 *)&v;
+				for (u32 i = 0; i < sizeof(T); ++i) {
+					p[i] = queue.pop().value_unchecked();
+				}
+			};
+
+			NetMessage message;
+
+			read(message.kind);
+
+			switch (message.kind) {
+				using enum NetMessageKind;
+#define C(x) case x: read(message.x); break;
+
+				C(brush)
+				C(set_position)
+				C(set_chunk)
+				C(end_chunk_transfer)
+
+#undef C
+				default:
+					print("bad message: {}\n", (u8)message.kind);
+					break;
+
+			}
+
+			scoped_lock(net_queue_mutex);
+			net_queue.push(message);
+		}
+	} catch (int) {
+	}
+}
+
+
+int main(int argc, char **argv) {
+	HINSTANCE hInstance = GetModuleHandleW(0);
 	init_allocator();
 
 	executable_path = get_executable_path();
@@ -3083,21 +3754,105 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 
 	construct(profiler);
 	construct(thread_pool);
-	construct(chunks_with_meshes);
 	construct(entities);
 	construct(saved_chunks);
+	construct(net_queue);
 	thread_count = get_cpu_info().logical_processor_count;
 	init_thread_pool(thread_pool, thread_count);
 	//init_thread_pool(thread_pool, 0);
 
-	AllocConsole();
-	freopen("CONOUT$", "w", stdout);
-
 	init_printer();
+
+	WSADATA wsaData;
+	if (auto err = WSAStartup(MAKEWORD(2, 2), &wsaData); err != 0) {
+		printf("WSAStartup failed: %d\n", err);
+		exit(1);
+	}
+	defer { WSACleanup(); };
+
+	// TODO: WTF?
+	// msvc optimized this to just int3
+	// this was good before and wasn't changed at all.
+#if 0
+	StaticRingQueue<u8, 4> test;
+	test.push(0);
+	test.push(1);
+	assert(test.pop().value() == 0);
+	assert(test.pop().value() == 1);
+	test.push(2);
+	test.push(3);
+	test.push(4);
+	test.push(5);
+	assert(test.pop().value() == 2);
+	assert(test.pop().value() == 3);
+	assert(test.pop().value() == 4);
+	assert(test.pop().value() == 5);
+	test.push(as_span({(u8)6,(u8)7,(u8)8,(u8)9}));
+	assert(test.pop().value() == 6);
+	assert(test.pop().value() == 7);
+	assert(test.pop().value() == 8);
+	assert(test.pop().value() == 9);
+	test.push(0);
+	assert(test.pop().value() == 0);
+	test.push(as_span({(u8)6,(u8)7,(u8)8,(u8)9}));
+	assert(test.pop().value() == 6);
+	assert(test.pop().value() == 7);
+	assert(test.pop().value() == 8);
+	assert(test.pop().value() == 9);
+#endif
+	if (argc != 1) {
+		opponent_socket = net::create_socket(net::Connection_tcp);
+
+		if (!net::connect(opponent_socket, inet_addr(argv[1]), 27015) != 0) {
+			print("connection failed");
+			print_wsa_error();
+			exit(1);
+		}
+
+		create_thread([] (Thread *) {
+			receive_loop();
+		}, 0);
+	} else {
+		is_server = true;
+		create_thread([] (Thread *) {
+
+			auto listener = net::create_socket(net::Connection_tcp);
+			if (!listener) {
+				printf("Error at socket(): %ld\n", WSAGetLastError());
+				exit(1);
+			}
+			defer { net::close(listener); };
+
+			net::bind(listener, 27015);
+
+			net::listen(listener, 1);
+
+			SOCKADDR_IN client;
+			char host[NI_MAXHOST]{};
+			char service[NI_MAXSERV]{};
+			int clientSize = sizeof(client);
+			print("accepting...\n");
+			opponent_socket = (net::Socket)accept((SOCKET)listener, (SOCKADDR*)&client, &clientSize);
+			if ((SOCKET)opponent_socket == INVALID_SOCKET) {
+				print("accept failed\n");
+				print_wsa_error();
+				exit(1);
+			}
+			if (getnameinfo((SOCKADDR*)&client, sizeof(client), host, NI_MAXHOST, service, NI_MAXSERV, 0) == 0) {
+				print("{} connected on port {}\n", host, service);
+			} else {
+				inet_ntop(AF_INET, &client.sin_addr, host, NI_MAXHOST);
+				print("{} connected on port {}\n", host, ntohs(client.sin_port));
+			}
+
+
+			receive_loop();
+		}, (void *)0);
+	}
 
 	auto save_path = format(u8"{}/world.save", executable_directory);
 
-	{
+	if (is_server) {
 		auto file = open_file(save_path, {.read=true});
 		if (is_valid(file)) {
 			defer { close(file); };
@@ -3165,6 +3920,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
 skip_load:
 
 	defer {
+		if (!is_server)
+			return;
+
 		profiler.reset();
 		defer { write_entire_file("save.tmd"s, as_bytes(profiler.output_for_timed())); };
 
@@ -3289,7 +4047,7 @@ skip_load:
 	};
 
 	camera = &entities.add();
-	camera->prev_position = camera->position = {0,1,0};
+	camera->prev_position = camera->position = {0,-3,0};
 
 
 	start();
@@ -3397,14 +4155,14 @@ skip_load:
 
 		sync(frame_time_counter, frame_time);
 
-		// NOTE: Reset chunk generation time each second
-		//if (get_performance_counter() >= stat_reset_timer + performance_frequency) {
-		//	stat_reset_timer += performance_frequency;
-		//	time_wasted_on_generating_chunks_per_frame = 0;
-		//	sdfs_generated_per_frame = 0;
-		//}
+		if (get_performance_counter() >= stat_reset_timer + performance_frequency) {
+			stat_reset_timer += performance_frequency;
+			generate_time.reset();
+		}
 
 		smooth_fps = lerp(smooth_fps, 1.0f / (f32)reset(actual_frame_timer), 0.25f);
+
+		clear_temporary_storage();
 	}
 
     return 0;

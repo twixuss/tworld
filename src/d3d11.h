@@ -36,8 +36,7 @@ inline void dhr(HRESULT hr, std::source_location location = std::source_location
     }
 }
 
-template <umm w, umm h>
-inline ID3D11ShaderResourceView *make_texture(v4u8 (&pixels)[w][h]) {
+inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h) {
 	ID3D11Texture2D *resource;
 	{
 		D3D11_TEXTURE2D_DESC desc {
@@ -70,4 +69,8 @@ inline ID3D11ShaderResourceView *make_texture(v4u8 (&pixels)[w][h]) {
 	immediate_context->GenerateMips(view);
 
 	return view;
+}
+template <umm w, umm h>
+inline ID3D11ShaderResourceView *make_texture(v4u8 (&pixels)[w][h]) {
+	return make_texture(pixels, w, h);
 }
