@@ -5,9 +5,11 @@
     <ClCompile Include="src\grid_map.cpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\cbuffer.h" />
     <ClInclude Include="src\d3d11.h" />
     <ClInclude Include="src\input.h" />
     <ClInclude Include="src\common.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Natvis Include="dep\tl\tl.natvis" />
   </ItemGroup>
 </Project>
