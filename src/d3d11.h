@@ -41,28 +41,30 @@ inline void dhr(HRESULT hr, std::source_location location = std::source_location
 	}
 }
 
-inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h) {
+inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h, u32 pixel_size, DXGI_FORMAT format, bool mips = true) {
 	ID3D11Texture2D *resource;
+	defer { resource->Release(); };
+
 	{
 		D3D11_TEXTURE2D_DESC desc {
 			.Width = w,
 			.Height = h,
-			.MipLevels = log2(ceil_to_power_of_2(max(w,h)))+1,
+			.MipLevels = mips ? log2(ceil_to_power_of_2(max(w,h)))+1 : 1,
 			.ArraySize = 1,
-			.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+			.Format = format,
 			.SampleDesc = {1,0},
-			.BindFlags = D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_RENDER_TARGET,
-			.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS,
+			.BindFlags = (UINT)(D3D11_BIND_SHADER_RESOURCE | (mips?D3D11_BIND_RENDER_TARGET:0)),
+			.MiscFlags = (UINT)(mips?D3D11_RESOURCE_MISC_GENERATE_MIPS:0),
 		};
 
 		dhr(device->CreateTexture2D(&desc, 0, &resource));
-		immediate_context->UpdateSubresource(resource, 0, 0, pixels, w*sizeof(v4u8), 1);
+		immediate_context->UpdateSubresource(resource, 0, 0, pixels, w*pixel_size, 1);
 	}
 
 	ID3D11ShaderResourceView *view;
 	{
 		D3D11_SHADER_RESOURCE_VIEW_DESC desc {
-			.Format = DXGI_FORMAT_R8G8B8A8_UNORM,
+			.Format = format,
 			.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D,
 			.Texture2D = {
 				.MipLevels = (UINT)-1,
@@ -71,13 +73,61 @@ inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h) {
 		dhr(device->CreateShaderResourceView(resource, &desc, &view));
 	}
 
-	immediate_context->GenerateMips(view);
+	if (mips)
+		immediate_context->GenerateMips(view);
 
 	return view;
 }
+inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h, u32 d, u32 pixel_size, DXGI_FORMAT format, bool mips = true) {
+	ID3D11Texture3D *resource;
+	defer { resource->Release(); };
+
+	{
+		D3D11_TEXTURE3D_DESC desc {
+			.Width = w,
+			.Height = h,
+			.Depth = d,
+			.MipLevels = mips ? log2(ceil_to_power_of_2(max(w,h)))+1 : 1,
+			.Format = format,
+			.BindFlags = (UINT)(D3D11_BIND_SHADER_RESOURCE | (mips?D3D11_BIND_RENDER_TARGET:0)),
+			.MiscFlags = (UINT)(mips?D3D11_RESOURCE_MISC_GENERATE_MIPS:0),
+		};
+
+		dhr(device->CreateTexture3D(&desc, 0, &resource));
+		immediate_context->UpdateSubresource(resource, 0, 0, pixels, w*pixel_size, w*h*pixel_size);
+	}
+
+	ID3D11ShaderResourceView *view;
+	{
+		D3D11_SHADER_RESOURCE_VIEW_DESC desc {
+			.Format = format,
+			.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D,
+			.Texture3D = {
+				.MipLevels = (UINT)-1,
+			},
+		};
+		dhr(device->CreateShaderResourceView(resource, &desc, &view));
+	}
+
+	if (mips)
+		immediate_context->GenerateMips(view);
+
+	return view;
+}
+inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h, bool mips = true) {
+	return make_texture(pixels, w, h, 4, DXGI_FORMAT_R8G8B8A8_UNORM, mips);
+}
 template <umm w, umm h>
-inline ID3D11ShaderResourceView *make_texture(v4u8 (&pixels)[w][h]) {
-	return make_texture(pixels, w, h);
+inline ID3D11ShaderResourceView *make_texture(v4u8 (&pixels)[w][h], bool mips = true) {
+	return make_texture(pixels, w, h, 4, DXGI_FORMAT_R8G8B8A8_UNORM, mips);
+}
+template <umm w, umm h>
+inline ID3D11ShaderResourceView *make_texture(u8 (&pixels)[w][h], bool mips = true) {
+	return make_texture(pixels, w, h, 1, DXGI_FORMAT_R8_UNORM, mips);
+}
+template <umm w, umm h, umm d>
+inline ID3D11ShaderResourceView *make_texture(u8 (&pixels)[w][h][d], bool mips = true) {
+	return make_texture(pixels, w, h, d, 1, DXGI_FORMAT_R8_UNORM, mips);
 }
 
 template <class T>
@@ -165,6 +215,11 @@ struct SBuffer {
 	}
 };
 
+template <class T>
+umm append(StringBuilder &builder, SBuffer<T> v) {
+	return append_format(builder, "{{srv={}, count={}}}", v.srv, v.count);
+}
+
 template <class T = void>
 struct CBuffer;
 
@@ -222,8 +277,9 @@ struct alignas(16) FrameCbuffer {
     m4 rotproj;
 	m4 light_vp_matrix;
 	v3f campos;
-	f32 _;
+	f32 time;
 	v3f ldir;
+	f32 frame;
 };
 CBuffer<FrameCbuffer> frame_cbuffer;
 
@@ -231,6 +287,8 @@ struct alignas(16) ChunkCbuffer {
     v3f relative_position;
 	f32 was_remeshed;
     v3f actual_position;
+	u32 vertex_offset;
+	f32 lod_t;
 };
 
 CBuffer<ChunkCbuffer> chunk_cbuffer;
@@ -243,11 +301,12 @@ CBuffer<ChunkCbuffer> chunk_cbuffer;
 #define VERTEX_BUFFER_SLOT 0
 #define INSTANCE_BUFFER_SLOT 1
 
-#define ALBEDO_TEXTURE_SLOT 2
-#define NORMAL_TEXTURE_SLOT 3
-#define AO_TEXTURE_SLOT     4
-#define SKY_TEXTURE_SLOT    5
-#define SHADOW_TEXTURE_SLOT 6
+#define ALBEDO_TEXTURE_SLOT   2
+#define NORMAL_TEXTURE_SLOT   3
+#define AO_TEXTURE_SLOT       4
+#define SKY_TEXTURE_SLOT      5
+#define SHADOW_TEXTURE_SLOT   6
+#define LOD_MASK_TEXTURE_SLOT 7
 
 #define HLSL_CBUFFER R"(
 cbuffer _ : register(b0) {
@@ -255,13 +314,16 @@ cbuffer _ : register(b0) {
     float4x4 c_rotproj;
 	float4x4 light_vp_matrix;
 	float3 c_campos;
-	float _;
+	float c_time;
 	float3 c_ldir;
+	float c_frame;
 }
 cbuffer _ : register(b1) {
     float3 c_relative_position;
 	float c_was_remeshed;
     float3 c_actual_position;
+	uint c_vertex_offset;
+	float c_lod_t;
 }
 
 SamplerState default_sampler          : register(s)" STRINGIZE(DEFAULT_SAMPLER_SLOT) R"();
@@ -271,11 +333,12 @@ SamplerComparisonState shadow_sampler : register(s)" STRINGIZE(SHADOW_SAMPLER_SL
 
 #define VERTEX_BUFFER_SLOT   register(t)" STRINGIZE(VERTEX_BUFFER_SLOT) R"()
 #define INSTANCE_BUFFER_SLOT register(t)" STRINGIZE(INSTANCE_BUFFER_SLOT) R"()
-Texture2D albedo_texture : register(t)" STRINGIZE(ALBEDO_TEXTURE_SLOT) R"();
-Texture2D normal_texture : register(t)" STRINGIZE(NORMAL_TEXTURE_SLOT) R"();
-Texture2D ao_texture     : register(t)" STRINGIZE(AO_TEXTURE_SLOT) R"();
-Texture2D sky_texture    : register(t)" STRINGIZE(SKY_TEXTURE_SLOT) R"();
-Texture2D shadow_texture : register(t)" STRINGIZE(SHADOW_TEXTURE_SLOT) R"();
+Texture2D albedo_texture   : register(t)" STRINGIZE(ALBEDO_TEXTURE_SLOT) R"();
+Texture2D normal_texture   : register(t)" STRINGIZE(NORMAL_TEXTURE_SLOT) R"();
+Texture2D ao_texture       : register(t)" STRINGIZE(AO_TEXTURE_SLOT) R"();
+Texture2D sky_texture      : register(t)" STRINGIZE(SKY_TEXTURE_SLOT) R"();
+Texture2D shadow_texture   : register(t)" STRINGIZE(SHADOW_TEXTURE_SLOT) R"();
+Texture3D lod_mask_texture : register(t)" STRINGIZE(LOD_MASK_TEXTURE_SLOT) R"();
 
 )"
 
@@ -319,6 +382,7 @@ X(float4)
 
 #define CHUNKW )" STRINGIZE(CHUNKW) R"(
 #define DRAWD )" STRINGIZE(DRAWD) R"(
+#define FARD )" STRINGIZE(FARD) R"(
 
 float3 srgb_to_rgb(float3 i)
 {
@@ -332,6 +396,22 @@ float3 srgb_to_rgb(float3 i)
 float3 rgb_to_srgb(float3 i)
 {
 	return lerp(i * 12.92, 1.055 * pow(i, 1.0 / 2.4) - 0.055, i > 0.0031308);
+}
+
+uint encode_normal(float3 n) {
+	float e = 0.001;
+	return
+		((uint)map(n.x, -1, 1, 0, 256-e) << 0) |
+		((uint)map(n.y, -1, 1, 0, 256-e) << 8) |
+		((uint)map(n.z, -1, 1, 0, 256-e) << 16);
+}
+
+float3 decode_normal(uint n) {
+	return float3(
+		map((n >>  0) & 0xff, 0, 256, -1, 1),
+		map((n >>  8) & 0xff, 0, 256, -1, 1),
+		map((n >> 16) & 0xff, 0, 256, -1, 1)
+	);
 }
 
 )"
