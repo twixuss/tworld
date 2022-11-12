@@ -3,3 +3,5 @@ bin/
 temp/
 *.tmd
 idk/
+dep/reactphysics3d/out/
+dep/reactphysics3d/documentation/

@@ -1,15 +1,29 @@
 #pragma once
+#include "common.h"
+
+#define NOMINMAX
 #include <d3d11.h>
+#include <dxgi1_6.h>
+#include <d3dcompiler.h>
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+
 
 #include <tl/common.h>
+#include <tl/console.h>
+#include <tl/math.h>
 using namespace tl;
+
+#define D3D11_DEBUG 1
 
 extern IDXGISwapChain *swap_chain;
 extern ID3D11Device *device;
 extern ID3D11DeviceContext *immediate_context;
 extern ID3D11RenderTargetView *back_buffer;
-extern ID3D11InfoQueue* debug_info_queue;
 
+#if D3D11_DEBUG
+extern ID3D11InfoQueue* debug_info_queue;
 inline void print_messages() {
     if (!debug_info_queue)
         return;
@@ -17,27 +31,30 @@ inline void print_messages() {
 
     for(UINT64 i = 0; i < message_count; i++){
         SIZE_T message_size = 0;
-        debug_info_queue->GetMessage(i, nullptr, &message_size); //get the size of the message
+        if (FAILED(debug_info_queue->GetMessage(i, nullptr, &message_size)))
+			continue; //get the size of the message
 
         D3D11_MESSAGE* message = (D3D11_MESSAGE*) malloc(message_size); //allocate enough space
-        debug_info_queue->GetMessage(i, message, &message_size); //get the actual message
+		defer { free(message); };
+
+        if (FAILED(debug_info_queue->GetMessage(i, message, &message_size)))
+			continue; //get the actual message
 
         //do whatever you want to do with it
         print("D3D11: {}\n", Span((char *)message->pDescription, message->DescriptionByteLength));
-
-        free(message);
     }
 
     debug_info_queue->ClearStoredMessages();
 }
+#endif
 
 inline void dhr(HRESULT hr, std::source_location location = std::source_location::current()) {
+#if D3D11_DEBUG
+    print_messages();
+#endif
     if (FAILED(hr)) {
-        print_messages();
-        print("bad HRESULT at {}\n", location);
+		print("bad HRESULT 0x{} at {}\n", FormatInt{.value=hr, .radix=16,.leading_zero_count=8}, location);
         debug_break();
-    } else {
-        print_messages();
 	}
 }
 
@@ -116,6 +133,11 @@ inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h, u32 d,
 }
 inline ID3D11ShaderResourceView *make_texture(void *pixels, u32 w, u32 h, bool mips = true) {
 	return make_texture(pixels, w, h, 4, DXGI_FORMAT_R8G8B8A8_UNORM, mips);
+}
+template <umm c>
+inline ID3D11ShaderResourceView *make_texture(u32 (&pixels)[c], bool mips = true) {
+	static_assert(is_power_of_2(c));
+	return make_texture(pixels, sqrt(c), sqrt(c), 4, DXGI_FORMAT_R8G8B8A8_UNORM, mips);
 }
 template <umm w, umm h>
 inline ID3D11ShaderResourceView *make_texture(v4u8 (&pixels)[w][h], bool mips = true) {
@@ -226,7 +248,7 @@ struct CBuffer;
 struct CBufferBase {
     ID3D11Buffer *cbuffer;
 
-    static void init(CBufferBase &buffer, u32 size) {
+    inline static void init(CBufferBase &buffer, u32 size) {
         D3D11_BUFFER_DESC desc {
             .ByteWidth = size,
             .Usage = D3D11_USAGE_DEFAULT,
@@ -235,7 +257,7 @@ struct CBufferBase {
         dhr(device->CreateBuffer(&desc, 0, &buffer.cbuffer));
     }
 
-    static CBuffer<> create(u32 size);
+    inline static CBuffer<> create(u32 size);
 
     template <class T>
     static CBuffer<T> create();
@@ -280,23 +302,26 @@ struct alignas(16) FrameCbuffer {
 	f32 time;
 	v3f ldir;
 	f32 frame;
+	u32 draw_mode;
 };
-CBuffer<FrameCbuffer> frame_cbuffer;
+inline CBuffer<FrameCbuffer> frame_cbuffer;
 
-struct alignas(16) ChunkCbuffer {
+struct alignas(16) EntityCbuffer {
+	m4 model;
+	v4f random;
     v3f relative_position;
 	f32 was_remeshed;
-    v3f actual_position;
 	u32 vertex_offset;
 	f32 lod_t;
 };
 
-CBuffer<ChunkCbuffer> chunk_cbuffer;
+inline CBuffer<EntityCbuffer> entity_cbuffer;
 
-#define DEFAULT_SAMPLER_SLOT       0
-#define DEFAULT_NOMIP_SAMPLER_SLOT 1
-#define NEAREST_SAMPLER_SLOT       2
-#define SHADOW_SAMPLER_SLOT        3
+#define DEFAULT_SAMPLER_SLOT        0
+#define DEFAULT_NOMIP_SAMPLER_SLOT  1
+#define NEAREST_SAMPLER_SLOT        2
+#define SHADOW_SAMPLER_SLOT         3
+#define NEAREST_MIRROR_SAMPLER_SLOT 4
 
 #define VERTEX_BUFFER_SLOT 0
 #define INSTANCE_BUFFER_SLOT 1
@@ -308,6 +333,12 @@ CBuffer<ChunkCbuffer> chunk_cbuffer;
 #define SHADOW_TEXTURE_SLOT   6
 #define LOD_MASK_TEXTURE_SLOT 7
 
+// NOTE: don't forget to update count.
+#define DRAW_MODE_DEFAULT     0
+#define DRAW_MODE_NORMAL      1
+#define DRAW_MODE_RANDOM      2
+#define DRAW_MODE_COUNT       3
+
 #define HLSL_CBUFFER R"(
 cbuffer _ : register(b0) {
     float4x4 c_mvp;
@@ -317,11 +348,13 @@ cbuffer _ : register(b0) {
 	float c_time;
 	float3 c_ldir;
 	float c_frame;
+	uint c_draw_mode;
 }
 cbuffer _ : register(b1) {
+	float4x4 c_model;
+    float4 c_random;
     float3 c_relative_position;
 	float c_was_remeshed;
-    float3 c_actual_position;
 	uint c_vertex_offset;
 	float c_lod_t;
 }
@@ -329,6 +362,7 @@ cbuffer _ : register(b1) {
 SamplerState default_sampler          : register(s)" STRINGIZE(DEFAULT_SAMPLER_SLOT) R"();
 SamplerState default_nomip_sampler    : register(s)" STRINGIZE(DEFAULT_NOMIP_SAMPLER_SLOT) R"();
 SamplerState nearest_sampler          : register(s)" STRINGIZE(NEAREST_SAMPLER_SLOT) R"();
+SamplerState nearest_mirror_sampler   : register(s)" STRINGIZE(NEAREST_MIRROR_SAMPLER_SLOT) R"();
 SamplerComparisonState shadow_sampler : register(s)" STRINGIZE(SHADOW_SAMPLER_SLOT) R"();
 
 #define VERTEX_BUFFER_SLOT   register(t)" STRINGIZE(VERTEX_BUFFER_SLOT) R"()
@@ -338,7 +372,7 @@ Texture2D normal_texture   : register(t)" STRINGIZE(NORMAL_TEXTURE_SLOT) R"();
 Texture2D ao_texture       : register(t)" STRINGIZE(AO_TEXTURE_SLOT) R"();
 Texture2D sky_texture      : register(t)" STRINGIZE(SKY_TEXTURE_SLOT) R"();
 Texture2D shadow_texture   : register(t)" STRINGIZE(SHADOW_TEXTURE_SLOT) R"();
-Texture3D lod_mask_texture : register(t)" STRINGIZE(LOD_MASK_TEXTURE_SLOT) R"();
+Texture2D lod_mask_texture : register(t)" STRINGIZE(LOD_MASK_TEXTURE_SLOT) R"();
 
 )"
 
@@ -383,6 +417,10 @@ X(float4)
 #define CHUNKW )" STRINGIZE(CHUNKW) R"(
 #define DRAWD )" STRINGIZE(DRAWD) R"(
 #define FARD )" STRINGIZE(FARD) R"(
+
+#define DRAW_MODE_DEFAULT     )" STRINGIZE(DRAW_MODE_DEFAULT    ) R"(
+#define DRAW_MODE_NORMAL      )" STRINGIZE(DRAW_MODE_NORMAL     ) R"(
+#define DRAW_MODE_RANDOM      )" STRINGIZE(DRAW_MODE_RANDOM     ) R"(
 
 float3 srgb_to_rgb(float3 i)
 {
@@ -449,22 +487,14 @@ float3 calculate_normal(float3 normal, float3 tangent, float3 tangent_space_norm
 		tangent_space_normal.z * normal
 	);
 }
-float3 calculate_normal(float3 normal, float4 tangent, float3 tangent_space_normal)
-{
-	return normalize(
-		tangent_space_normal.x * tangent.xyz +
-		tangent_space_normal.y * cross(normal, tangent.xyz) * tangent.w +
-		tangent_space_normal.z * normal
-	);
-}
 float3 unpack_normal(float3 color, float scale) {
-	return map(
+	return normalize(map(
 		color,
 		0,
 		1,
 		float3(-scale,-scale,0),
 		float3(+scale,+scale,1)
-	);
+	));
 }
 float3 world_normal(float3 normal, float3 tangent, float3 color, float scale) {
 	return calculate_normal(normal, tangent, unpack_normal(color, scale));
@@ -472,6 +502,73 @@ float3 world_normal(float3 normal, float3 tangent, float3 color, float scale) {
 float3 world_normal(float3 normal, float4 tangent, float3 color, float scale) {
 	return calculate_normal(normal, tangent, unpack_normal(color, scale));
 }
+
+struct LightingStuff {
+	float3 view;
+	float3 N;
+	float3 V;
+	float3 L;
+	float3 H;
+	float NV;
+	float NL;
+	float NH;
+	float VH;
+	float3 shadow_uv;
+	float shadow_mask;
+
+	float3 basic_lighting(float3 albedo, float ao, float roughness, float4 pixel_position) {
+		float3 ambient_color = sky_texture.Load(int3(pixel_position.xy, 0));
+
+		float shininess = (1 - roughness) * 100;
+		float3 specular = min(1, NL * 10) * pow(NH, shininess) * shininess / 100;
+		float3 diffuse = albedo * NL * (1-specular);
+
+		float3 ambient = ambient_color * albedo / pi * ao;
+
+		float lightness = lerp(shadow_texture.SampleCmpLevelZero(shadow_sampler, shadow_uv.xy, shadow_uv.z).x, 1, shadow_mask);
+		float3 result = ambient + (diffuse + specular) * lightness;
+
+		float fog = min(1, length(view) / (CHUNKW*FARD));
+		fog *= fog;
+		fog *= fog;
+		return lerp(result, ambient_color, fog);
+	}
+
+};
+
+LightingStuff lighting_stuff(float3 N, float3 L, float3 view, float4 shadow_uv) {
+
+	float3 V = normalize(view);
+	float3 H = normalize(V + L);
+
+	LightingStuff stuff;
+	stuff.view = view;
+	stuff.N = N;
+	stuff.V = V;
+	stuff.L = L;
+	stuff.H = H;
+	stuff.NV = max(dot(N, V), 0);
+	stuff.NL = max(dot(N, L), 0);
+	stuff.NH = max(dot(N, H), 0);
+	stuff.VH = max(dot(V, H), 0);
+
+	shadow_uv /= shadow_uv.w;
+	shadow_uv.y *= -1;
+	stuff.shadow_mask = saturate(map(length(shadow_uv.xyz), 0.9, 1, 0, 1));
+	stuff.shadow_uv = (shadow_uv * 0.5 + 0.5).xyz;
+
+	return stuff;
+}
+
+float4 surface(float3 N, float3 c_ldir, float3 view, float4 shadow_map_uv, float3 albedo, float ao, float roughness, float4 pixel_position) {
+	switch (c_draw_mode) {
+		case DRAW_MODE_DEFAULT:     return float4(lighting_stuff(N, c_ldir, view, shadow_map_uv).basic_lighting(albedo, ao, roughness, pixel_position), 1);
+		case DRAW_MODE_NORMAL:      return float4(N, 1); //return float4(N*0.5+0.5, 1);
+		case DRAW_MODE_RANDOM:      return c_random;
+		default: return float4(1,0,1,1);
+	}
+}
+
 )"
 
 #define HLSL_TRIPLANAR R"(
@@ -513,3 +610,43 @@ float3 triplanar_normal(Texture2D tex, SamplerState sam, float3 wpos, float3 nor
 	return normalize(nx.zyx * t.x + ny.xzy * t.y + nz.xyz * t.z);
 }
 )"
+
+inline ID3D11VertexShader *create_vs(auto source) {
+	ID3DBlob *errors = 0;
+	auto print_errors = [&] {
+		print(Span((char *)errors->GetBufferPointer(), errors->GetBufferSize()));
+	};
+
+	ID3DBlob *code = 0;
+	if (FAILED(D3DCompile(source.data, source.count, "vs_source", 0, 0, "main", "vs_5_0", 0, 0, &code, &errors))) {
+		print_errors();
+		invalid_code_path();
+	} else if (errors) {
+		print_errors();
+		errors->Release();
+		errors = 0;
+	}
+	ID3D11VertexShader *vs;
+	dhr(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), 0, &vs));
+	return vs;
+}
+
+inline ID3D11PixelShader *create_ps(auto source) {
+	ID3DBlob *errors = 0;
+	auto print_errors = [&] {
+		print(Span((char *)errors->GetBufferPointer(), errors->GetBufferSize()));
+	};
+
+	ID3DBlob *code = 0;
+	if (FAILED(D3DCompile(source.data, source.count, "ps_source", 0, 0, "main", "ps_5_0", 0, 0, &code, &errors))) {
+		print_errors();
+		invalid_code_path();
+	} else if (errors) {
+		print_errors();
+		errors->Release();
+		errors = 0;
+	}
+	ID3D11PixelShader *ps;
+	dhr(device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), 0, &ps));
+	return ps;
+}

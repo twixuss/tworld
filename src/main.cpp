@@ -1,3 +1,7 @@
+// TODO:
+// crash in tracking allocator.
+//     when reallocating, the metainfo for old pointer is not found.
+
 #define _CRT_SECURE_NO_WARNINGS
 #define _WINSOCK_DEPRECATED_NO_WARNINGS
 
@@ -27,23 +31,17 @@
 #include <tl/masked_block_list.h>
 #include <tl/mesh.h>
 #include <tl/tracking_allocator.h>
+#include <tl/main.h>
 #include <algorithm>
 #include <random>
 
 #pragma comment(lib, "freetype.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 using namespace tl;
 
-#include <dxgi1_6.h>
-#include <d3dcompiler.h>
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "d3dcompiler.lib")
-#pragma comment(lib, "ws2_32.lib")
-
-#include "d3d11.h"
+#include "shaders.h"
 #include "input.h"
-#include "common.h"
 
 #include <freetype/freetype.h>
 #define TL_FONT_TEXTURE_HANDLE ID3D11ShaderResourceView *
@@ -52,10 +50,33 @@ using namespace tl;
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
-#define USE_INDICES 0
+#pragma push_macro("scoped_lock")
+#undef scoped_lock
+#include <reactphysics3d/reactphysics3d.h>
+#pragma pop_macro("scoped_lock")
+#pragma comment(lib, "reactphysics3d.lib")
 
 // this is stupid
 #pragma pop_macro("assert")
+
+v4f random_v4f(v3s v) {
+	return {
+		random_f32(v),
+		random_f32(v.yzx()),
+		random_f32(v.zxy()),
+		random_f32(v.zyx()),
+	};
+}
+
+namespace p = reactphysics3d;
+
+p::PhysicsCommon physics;
+p::PhysicsWorld *physics_world;
+
+v3f to_v3f(p::Vector3 v) { return {v.x, v.y, v.z}; }
+p::Vector3 to_pv(v3f v) { return {v.x, v.y, v.z}; }
+
+#define USE_INDICES 0
 
 void print_wsa_error();
 
@@ -86,46 +107,13 @@ ID3D11RasterizerState *wireframe_rasterizer;
 ID3D11RasterizerState *no_cull_rasterizer;
 ID3D11RasterizerState *shadow_rasterizer;
 ID3D11RasterizerState *no_cull_shadow_rasterizer;
+ID3D11RasterizerState *scissor_rasterizer;
+
 bool wireframe_rasterizer_enabled;
 
 ID3D11BlendState *alpha_blend;
 ID3D11BlendState *font_blend;
 ID3D11BlendState *alpha_to_coverage_blend;
-
-ID3D11VertexShader *chunk_sdf_vs = 0;
-ID3D11PixelShader *chunk_sdf_solid_ps = 0;
-ID3D11PixelShader *chunk_sdf_wire_ps = 0;
-
-ID3D11VertexShader *chunk_block_vs = 0;
-ID3D11PixelShader  *chunk_block_ps = 0;
-
-ID3D11VertexShader *cursor_vs = 0;
-ID3D11PixelShader  *cursor_ps = 0;
-
-ID3D11VertexShader *sky_vs = 0;
-ID3D11PixelShader  *sky_ps = 0;
-
-ID3D11VertexShader *blit_vs = 0;
-ID3D11PixelShader  *blit_ps = 0;
-
-ID3D11VertexShader *shadow_vs = 0;
-ID3D11PixelShader  *shadow_ps = 0;
-
-ID3D11VertexShader *font_vs = 0;
-ID3D11PixelShader  *font_ps = 0;
-
-ID3D11VertexShader *crosshair_vs = 0;
-ID3D11PixelShader  *crosshair_ps = 0;
-
-ID3D11GeometryShader *grass_gs = 0;
-ID3D11VertexShader   *grass_vs = 0;
-ID3D11PixelShader    *grass_ps = 0;
-
-ID3D11VertexShader *tree_vs = 0;
-ID3D11PixelShader  *tree_ps = 0;
-
-ID3D11VertexShader *tree_shadow_vs = 0;
-ID3D11PixelShader  *tree_shadow_ps = 0;
 
 ID3D11ShaderResourceView *font_vertex_buffer = 0;
 
@@ -146,6 +134,10 @@ ID3D11SamplerState *default_sampler_clamp;
 
 ID3D11ShaderResourceView *lod_mask;
 
+ID3D11ShaderResourceView *default_albedo;
+ID3D11ShaderResourceView *default_normal;
+ID3D11ShaderResourceView *default_ao;
+
 struct VertexBuffer {
 	ID3D11ShaderResourceView *view = 0;
 	u32 vertex_count = 0;
@@ -156,12 +148,25 @@ VertexBuffer farlands_vb;
 List<utf8> executable_path;
 Span<utf8> executable_directory;
 
+u32 draw_mode;
+
+u32 draw_call_count;
+
 f32 frame_time;
 
 u32 chunk_generation_amount_factor = 1;
 
 bool draw_grass = true;
 bool draw_trees = true;
+
+bool draw_collision_shape = false;
+
+struct BasicVertex {
+	v3f position;
+	v3f normal;
+	v2f uv;
+	v4f tangent;
+};
 
 struct Model {
 	ID3D11ShaderResourceView *vb;
@@ -174,28 +179,34 @@ struct Model {
 	bool no_cull = false;
 };
 
-struct LodList {
+struct LodModel {
+	ID3D11ShaderResourceView *vertex_buffer;
+	ID3D11Buffer *index_buffer;
+
+	ID3D11ShaderResourceView *albedo;
+	ID3D11ShaderResourceView *normal;
+	ID3D11ShaderResourceView *ao;
+	bool no_cull = false;
+
 	struct Lod {
-		Model model;
 		u32 end_distance;
+		bool cast_shadow;
+		u32 index_count;
+		u32 start_index;
+		u32 start_vertex;
 	};
 	List<Lod> lods;
-	Model &add_lod(u32 end_distance, Model model) {
-		return lods.add({.model = model, .end_distance = end_distance}).model;
-	}
-	Model &add_lod(u32 end_distance) {
-		return lods.add({.end_distance = end_distance}).model;
-	}
-	Model &get_lod(u32 distance) {
+	Lod &get_lod(u32 distance) {
 		for (auto &lod : lods) {
 			if (distance <= lod.end_distance)
-				return lod.model;
+				return lod;
 		}
-		return lods.back().model;
+		return lods.back();
 	}
 };
 
-LodList tree_model;
+LodModel tree_model;
+LodModel grenade_model;
 
 struct TreeInstance {
 	m3 matrix;
@@ -250,6 +261,7 @@ StatValue<f32> actual_fps;
 f32 smooth_fps;
 
 Profiler profiler;
+bool show_profile;
 bool profile_frame;
 
 f32 target_frame_time;
@@ -290,15 +302,17 @@ struct ChunkRelativePosition {
 	ChunkRelativePosition &operator-=(ChunkRelativePosition that) { return *this += -that; }
 
 	void normalize() {
+		if (isnan(local.x) ||
+			isnan(local.y) ||
+			isnan(local.z))
+		{
+			with(ConsoleColor::red, print("local position is NAN!\n"));
+			local = {};
+			return;
+		}
 		auto chunk_offset = floor(floor_to_int(local), CHUNKW);
 		chunk += chunk_offset / CHUNKW;
 		local -= (v3f)chunk_offset;
-		ensure_valid();
-	}
-	void ensure_valid() {
-		assert(!isnan(local.x));
-		assert(!isnan(local.y));
-		assert(!isnan(local.z));
 	}
 	v3f to_v3f() {
 		return (v3f)(chunk * CHUNKW) + local;
@@ -328,36 +342,37 @@ union ComponentId {
 struct Entity;
 
 struct Component {
-	Entity &entity;
-	Component() : entity(*(Entity *)0) {}
-	Component &operator=(Component const &that) {
-		memcpy(this, &that, sizeof(that));
-		return *this;
-	}
-	void on_destroy() {}
+	Entity *entity = 0;
+	void start() {}
+	void update() {}
+	void on_free() {}
 };
 
 struct Entity {
 	u32 entity_index;
 	ChunkRelativePosition position = {};
+	p::Quaternion rotation = p::Quaternion::identity();
 	StaticList<ComponentId, 16> components;
 
 	template <class T>
 	T &add_component();
+
+	template <class T>
+	T *get_component();
 };
 
-StaticMaskedBlockList<Entity, 256> entities;
+StaticMaskedBlockList<Entity, 512> entities;
 
 LinearSet<Entity *> entities_to_remove;
 
-Entity &create_entity() {
+Entity *create_entity() {
 	auto added = entities.add();
 	added.pointer->entity_index = added.index;
-	return *added.pointer;
+	return added.pointer;
 }
 
-void enqueue_entity_removal(Entity &entity) {
-	entities_to_remove.insert(&entity);
+void enqueue_entity_removal(Entity *entity) {
+	entities_to_remove.insert(entity);
 }
 
 
@@ -370,19 +385,34 @@ ComponentList<T> components;
 template <class T>
 extern u64 component_index;
 
-struct PhysicsComponent : Component {
-	ChunkRelativePosition prev_position = {};
-	aabb<v3f> collision_box = {{-1,-1,-1}, {1,1,1}};
-	v3f acceleration = {0,-9.8,0};
-	v3f velocity_multiplier = {1,1,1};
+struct RemoverComponent : Component {
+	f32 time_left;
 	void update() {
-		apply_physics(entity.position, prev_position, velocity_multiplier, acceleration, collision_box);
+		time_left -= target_frame_time;
+		if (time_left < 0) {
+			enqueue_entity_removal(entity);
+		}
+	}
+};
+
+struct PhysicsComponent : Component {
+	p::RigidBody* body;
+	p::Collider *collider;
+	void start() {
+		body = physics_world->createRigidBody({{}, p::Quaternion::identity()});
+		body->setType(p::BodyType::DYNAMIC);
+		collider = body->addCollider(physics.createBoxShape({1,1,1}), {});
+	}
+	void set_box_shape(aabb<v3f> box) {
+		body->removeCollider(collider);
+		collider = body->addCollider(physics.createBoxShape(to_pv(box.size() / 2)), {to_pv(box.center()), p::Quaternion::identity()});
+		body->updateLocalCenterOfMassFromColliders();
 	}
 	void set_velocity(v3f velocity) {
-		prev_position = entity.position - velocity * target_frame_time;
+		body->setLinearVelocity(to_pv(velocity));
 	}
-	void add_velocity(v3f velocity) {
-		prev_position -= velocity * target_frame_time;
+	void on_free() {
+		physics_world->destroyRigidBody(body);
 	}
 };
 
@@ -394,13 +424,12 @@ struct ParticleSystemComponent : Component {
 	List<Particle> particles;
 
 	v3s particles_chunk_position;
-	f32 time_to_live_left = 1;
 	void init(u32 particle_count) {
-		particles_chunk_position = entity.position.chunk;
+		particles_chunk_position = entity->position.chunk;
 		particles.resize(particle_count);
 		xorshift32 random { get_performance_counter() };
 		for (auto &particle : particles) {
-			particle.position = entity.position.local;
+			particle.position = entity->position.local;
 			particle.velocity = normalize(next_v3f(random) - 0.5f) * map<f32>(next_f32(random), 0, 1, 1, 2) * 10 * target_frame_time;
 		}
 	}
@@ -409,38 +438,35 @@ struct ParticleSystemComponent : Component {
 			particle.position += particle.velocity;
 			particle.velocity += v3f{0,-9.8,0}*2*pow2(target_frame_time);
 		}
-
-		time_to_live_left -= target_frame_time;
-		if (time_to_live_left < 0) {
-			enqueue_entity_removal(entity);
-		}
 	}
-	void on_destroy() {
+	void on_free() {
 		free(particles);
 	}
 };
 
 struct GrenadeComponent : Component {
-	f32 timer = 1;
-	void update() {
-		timer -= target_frame_time;
-		if (timer < 0) {
-			xorshift32 random { get_performance_counter() };
+	void on_free() {
+		xorshift32 random { get_performance_counter() };
 
-			for (u32 i = 0; i < 16; ++i) {
-				add_sdf_sphere_synchronized(entity.position + (next_v3f(random) * 8 - 4), map<f32>(next_f32(random), 0, 1, 2, 4), -256);
-			}
-
-			enqueue_entity_removal(entity);
-
-			auto &ps_entity = create_entity();
-			ps_entity.position = entity.position;
-
-			auto &ps = ps_entity.add_component<ParticleSystemComponent>();
-			ps.time_to_live_left = 1;
-			ps.init(100);
+		for (u32 i = 0; i < 16; ++i) {
+			add_sdf_sphere_synchronized(entity->position + (next_v3f(random) * 8 - 4), map<f32>(next_f32(random), 0, 1, 2, 4), -256);
 		}
+
+		enqueue_entity_removal(entity);
+
+		auto ps_entity = create_entity();
+		ps_entity->position = entity->position;
+
+		auto &ps = ps_entity->add_component<ParticleSystemComponent>();
+		ps.init(100);
+
+		auto &remover = ps_entity->add_component<RemoverComponent>();
+		remover.time_left = 1;
 	}
+};
+
+struct MeshComponent : Component {
+	LodModel *model;
 };
 
 
@@ -450,9 +476,11 @@ ENUMERATE_COMPONENTS
 #undef e
 */
 #define ENUMERATE_COMPONENTS \
+e(RemoverComponent) \
 e(PhysicsComponent) \
 e(ParticleSystemComponent) \
 e(GrenadeComponent) \
+e(MeshComponent) \
 
 enum {
 #define e(name) name##_index,
@@ -476,7 +504,19 @@ T &Entity::add_component() {
 		.component_type = component_index<T>,
 	});
 
+	component.pointer->start();
+
 	return *component.pointer;
+}
+
+template <class T>
+T *Entity::get_component() {
+	for (auto component_index : components) {
+		if (component_index.component_type == ::component_index<T>) {
+			return &::components<T>[component_index.component_index];
+		}
+	}
+	return 0;
 }
 
 enum class CameraMode {
@@ -492,10 +532,14 @@ v3f camera_angles;
 f32 camera_fov = 90;
 
 Entity *camera;
-ChunkRelativePosition camera_prev_position;
-// NOTE: this is not the same as camera_prev_position.chunk
-// camera_prev_position is used in physics, so it may not represent the actual previous position in previous frame.
-v3s camera_chunk_last_frame;
+
+v3s last_world_origin;
+v3s current_world_origin;
+
+v3f relative_to_origin(ChunkRelativePosition position) {
+	position.chunk -= current_world_origin;
+	return position.to_v3f();
+}
 
 struct NeighborMask {
 	bool x : 1;
@@ -510,6 +554,8 @@ umm append(StringBuilder &builder, NeighborMask v) {
 struct ChunkVertex {
 	v3f position;
 	u32 normal;
+	v3f parent_position;
+	u32 parent_normal;
 };
 
 u32 encode_normal(v3f n) {
@@ -548,6 +594,16 @@ struct Sdf {
 	s8 _5[CHUNKW/32][CHUNKW/32][CHUNKW/32];
 };
 
+struct PhysicsVertex {
+	v3f position;
+	v3f normal;
+};
+
+struct Tree {
+	v3f position;
+	p::Quaternion rotation;
+};
+
 struct Chunk {
 	ID3D11ShaderResourceView *sdf_vb = 0;
 	u32 sdf_vb_vertex_count[6] = {};
@@ -560,7 +616,11 @@ struct Chunk {
 	ID3D11Buffer *index_buffer = 0;
 #endif
 
-	List<v3f> sdf_vertex_positions;
+	List<PhysicsVertex> physics_vertices;
+	List<u32> physics_indices;
+
+	List<Tree> trees;
+
 #if USE_INDICES
 	List<u32> indices;
 	u32 indices_count = 0;
@@ -570,6 +630,11 @@ struct Chunk {
 	Sdf *sdf = 0;
 
 	Block (*blocks)[CHUNKW][CHUNKW][CHUNKW] = 0;
+
+	p::RigidBody *body = 0;
+	p::TriangleMesh *triangle_mesh = 0;
+	p::TriangleVertexArray subpart;
+	p::ConcaveMeshShape *shape = 0;
 
 	f32 lod_t = 1;
 
@@ -585,9 +650,7 @@ struct Chunk {
 	bool needs_saving            : 1 = false;
 	bool needs_filter_and_remesh : 1 = false;
 
-#if DEBUG_CHUNK_THREAD_ACCESS
 	RecursiveMutex mutex;
-#endif
 
 	Chunk() = default;
 	Chunk(Chunk const &) = delete;
@@ -645,11 +708,11 @@ v3s get_chunk_position(s32 index) {
 		index,
 	} % s;
 
-	v += floor(camera->position.chunk+DRAWD, s);
+	v += floor(current_world_origin+DRAWD, s);
 
-	v -= s * (v3s)(v > camera->position.chunk+DRAWD);
+	v -= s * (v3s)(v > current_world_origin+DRAWD);
 
-	auto r = absolute(v - camera->position.chunk);
+	auto r = absolute(v - current_world_origin);
 	assert(-DRAWD <= r.x && r.x <= DRAWD);
 	assert(-DRAWD <= r.y && r.y <= DRAWD);
 	assert(-DRAWD <= r.z && r.z <= DRAWD);
@@ -728,7 +791,7 @@ void apply_physics(ChunkRelativePosition &position, ChunkRelativePosition &prev_
 	auto velocity = (position - prev_position).to_v3f();
 
 	prev_position = position;
-	position += velocity*velocity_multiplier + acceleration*2*pow2(target_frame_time);
+	position += velocity*velocity_multiplier + acceleration*2*pow2(frame_time);
 
 
 	v3f collision_points[] = {
@@ -752,13 +815,13 @@ void apply_physics(ChunkRelativePosition &position, ChunkRelativePosition &prev_
 		for (i = 0; i < iter_max; ++i) {
 			if (auto sdf_ = sdf_at_interpolated(corner_pos)) {
 				auto sdf = sdf_.value_unchecked();
-				if (sdf < 0) {
+				if (sdf <= 0) {
 					break;
 				}
 				if (auto gradient = gradient_at(corner_pos)) {
 					corner_pos += gradient.value_unchecked() / iter_max;
 				} else {
-					corner_pos += v3f{0,target_frame_time,0};
+					corner_pos += v3f{0,1,0};
 					fallback = true;
 				}
 			}
@@ -846,9 +909,9 @@ template <class Fn>
 void for_each_chunk(Fn &&fn) {
 	timed_function(profiler, profile_frame);
 
-	for (s32 x = camera->position.chunk.x-DRAWD; x <= camera->position.chunk.x+DRAWD; ++x) {
-	for (s32 y = camera->position.chunk.y-DRAWD; y <= camera->position.chunk.y+DRAWD; ++y) {
-	for (s32 z = camera->position.chunk.z-DRAWD; z <= camera->position.chunk.z+DRAWD; ++z) {
+	for (s32 x = current_world_origin.x-DRAWD; x <= current_world_origin.x+DRAWD; ++x) {
+	for (s32 y = current_world_origin.y-DRAWD; y <= current_world_origin.y+DRAWD; ++y) {
+	for (s32 z = current_world_origin.z-DRAWD; z <= current_world_origin.z+DRAWD; ++z) {
 		fn(get_chunk(x,y,z), {x,y,z});
 	}
 	}
@@ -898,7 +961,7 @@ NeighborMask get_neighbor_mask(v3s position) {
 	else if (_001) mask = {.z=true};
 	else mask = {};
 
-	auto r = position != camera->position.chunk + DRAWD;
+	auto r = position != current_world_origin + DRAWD;
 	mask.x &= r.x;
 	mask.y &= r.y;
 	mask.z &= r.z;
@@ -1296,10 +1359,12 @@ void generate_grass(Chunk *chunk, v3s chunk_position) {
 		f32 h = map<f32>(next_f32(rng), 0, 1, 1.5, 2.5);
 
 		for (u32 i = 0; i < 3; ++i) {
-			Vertex _0 = {.origin = position, .position = position + V3f(m * v2f{-1,0}, -0.5f).xzy(), .normal = normal, .uv = {u+0.0f,1}};
-			Vertex _1 = {.origin = position, .position = position + V3f(m * v2f{-1,0},h-0.5f).xzy(), .normal = normal, .uv = {u+0.0f,0}};
-			Vertex _2 = {.origin = position, .position = position + V3f(m * v2f{+1,0}, -0.5f).xzy(), .normal = normal, .uv = {u+0.5f,1}};
-			Vertex _3 = {.origin = position, .position = position + V3f(m * v2f{+1,0},h-0.5f).xzy(), .normal = normal, .uv = {u+0.5f,0}};
+			Vertex _0 = {.position = position + V3f(m * v2f{-1,0}, -0.5f).xzy(), .normal = normal, .uv = {u+0.0f,1}};
+			Vertex _1 = {.position = position + V3f(m * v2f{-1,0},h-0.5f).xzy(), .normal = normal, .uv = {u+0.0f,0}};
+			Vertex _2 = {.position = position + V3f(m * v2f{+1,0}, -0.5f).xzy(), .normal = normal, .uv = {u+0.5f,1}};
+			Vertex _3 = {.position = position + V3f(m * v2f{+1,0},h-0.5f).xzy(), .normal = normal, .uv = {u+0.5f,0}};
+			_0.origin = _1.origin = _0.position;
+			_2.origin = _3.origin = _2.position;
 			vertices.add(_0);
 			vertices.add(_1);
 			vertices.add(_2);
@@ -1341,10 +1406,14 @@ void generate_trees(Chunk *chunk, v3s chunk_position) {
 
 	StaticList<TreeInstance, CHUNKW*CHUNKW> trees;
 
+	chunk->trees.clear();
+
 	auto put_tree = [&] (v3f position) {
 		if (next_f32(rng) < 0.02f) {
+			f32 angle = next_f32(rng)*tau;
+			chunk->trees.add({position, p::Quaternion::fromEulerAngles(0,angle,0)});
 			trees.add({
-				.matrix = m3::rotation_r_y(next_f32(rng)*tau) * m3::scale(map<f32>(next_f32(rng), 0, 1, 0.75, 1.25)),
+				.matrix = m3::rotation_r_y(angle) * m3::scale(map<f32>(next_f32(rng), 0, 1, 0.75, 1.25)),
 				.position = position,
 			});
 		}
@@ -1371,7 +1440,9 @@ void generate_trees(Chunk *chunk, v3s chunk_position) {
 }
 
 template <umm dim>
-void sdf_to_triangles(v3s lbounds, auto &&sdf, auto &&modify_point, auto &&add_vertex) {
+void sdf_to_triangles(v3s lbounds, auto &&sdf, auto &&add_vertex, auto &&add_index)
+	requires requires { {add_vertex(ChunkVertex{})}; {add_index(u32{})}; }
+{
 
 	struct Edge {
 		u8 a, b;
@@ -1392,18 +1463,26 @@ void sdf_to_triangles(v3s lbounds, auto &&sdf, auto &&modify_point, auto &&add_v
 		{0b011, 0b111},
 	};
 
+	// NOTE:
+	// If we use 0 and 1 for corners and sdf happens to be is 0, then a vertex will be exactly on the boundary, which can cause multiple
+	// vertices exist at the same position, which in turn will cause physics problems.
+	// To prevent this, offset the corners by small enough value.
+	f32 const e = 0.001;
 	v3f corners[8] {
-		{0, 0, 0},
-		{0, 0, 1},
-		{0, 1, 0},
-		{0, 1, 1},
-		{1, 0, 0},
-		{1, 0, 1},
-		{1, 1, 0},
-		{1, 1, 1},
+		{e,   e,   e  },
+		{e,   e,   1-e},
+		{e,   1-e, e  },
+		{e,   1-e, 1-e},
+		{1-e, e,   e  },
+		{1-e, e,   1-e},
+		{1-e, 1-e, e  },
+		{1-e, 1-e, 1-e},
 	};
 
-	ChunkVertex points[dim+3][dim+3][dim+3];
+	u32 indices[dim+3][dim+3][dim+3];
+
+	u32 current_index = 0;
+	u32 vertex_count = 0;
 
 	{
 		timed_block(profiler, profile_frame, "point generation");
@@ -1444,10 +1523,12 @@ void sdf_to_triangles(v3s lbounds, auto &&sdf, auto &&modify_point, auto &&add_v
 					}
 				}
 				point /= divisor;
-				points[lx][ly][lz].position = modify_point(point + V3f(lx,ly,lz));
+
+				ChunkVertex vertex;
+				vertex.position = point + V3f(lx,ly,lz);
 
 				// NOTE: Maybe there is no need to convert this to float and back to int?
-				points[lx][ly][lz].normal = encode_normal(normalize((v3f)v3s{
+				vertex.normal = encode_normal(normalize((v3f)v3s{
 					d[0b000] - d[0b100] +
 					d[0b001] - d[0b101] +
 					d[0b010] - d[0b110] +
@@ -1461,6 +1542,11 @@ void sdf_to_triangles(v3s lbounds, auto &&sdf, auto &&modify_point, auto &&add_v
 					d[0b100] - d[0b101] +
 					d[0b110] - d[0b111],
 				}));
+
+				indices[lx][ly][lz] = current_index++;
+
+				add_vertex(vertex);
+				++vertex_count;
 			}
 		}
 		}
@@ -1472,61 +1558,66 @@ void sdf_to_triangles(v3s lbounds, auto &&sdf, auto &&modify_point, auto &&add_v
 		for (s32 lx = 1; lx < lbounds.x-1; ++lx) {
 		for (s32 ly = 1; ly < lbounds.y-1; ++ly) {
 		for (s32 lz = 1; lz < lbounds.z-1; ++lz) {
-			auto add = [&](v3s v) {
-				add_vertex(points[v.x][v.y][v.z]);
+			auto quad = [&](v3s _0, v3s _1, v3s _2, v3s _3) {
+				auto i0 = indices[_0.x][_0.y][_0.z];
+				auto i1 = indices[_1.x][_1.y][_1.z];
+				auto i2 = indices[_2.x][_2.y][_2.z];
+				auto i3 = indices[_3.x][_3.y][_3.z];
+
+				assert(i0 < vertex_count);
+				assert(i1 < vertex_count);
+				assert(i2 < vertex_count);
+				assert(i3 < vertex_count);
+
+				add_index(i0);
+				add_index(i1);
+				add_index(i2);
+				add_index(i1);
+				add_index(i3);
+				add_index(i2);
 			};
 
-			if ((sdf(lx,ly,lz) > 0) != (sdf(lx+1,ly,lz) > 0)) {
+			auto s0 = sdf(lx,ly,lz);
+			auto s1 = sdf(lx+1,ly,lz);
+			auto s2 = sdf(lx,ly+1,lz);
+			auto s3 = sdf(lx,ly,lz+1);
+			if ((s0 > 0) != (s1 > 0)) {
 				v3s _0 = {lx, ly-1, lz-1};
 				v3s _1 = {lx, ly+0, lz-1};
 				v3s _2 = {lx, ly-1, lz+0};
 				v3s _3 = {lx, ly+0, lz+0};
 
-				if (!(sdf(lx,ly,lz) > 0)) {
+				if (!(s0 > 0)) {
 					swap(_0, _3);
 				}
 
-				add(_0);
-				add(_1);
-				add(_2);
-				add(_1);
-				add(_3);
-				add(_2);
+				quad(_0, _1, _2, _3);
 			}
-			if ((sdf(lx,ly,lz) > 0) != (sdf(lx,ly+1,lz) > 0)) {
+			if ((s0 > 0) != (s2 > 0)) {
 				v3s _0 = {lx-1, ly, lz-1};
 				v3s _1 = {lx+0, ly, lz-1};
 				v3s _2 = {lx-1, ly, lz+0};
 				v3s _3 = {lx+0, ly, lz+0};
 
-				if (sdf(lx,ly,lz) > 0) {
+				if (s0 > 0) {
 					swap(_0, _3);
 				}
 
-				add(_0);
-				add(_1);
-				add(_2);
-				add(_1);
-				add(_3);
-				add(_2);
+				quad(_0, _1, _2, _3);
 			}
-			if ((sdf(lx,ly,lz) > 0) != (sdf(lx,ly,lz+1) > 0)) {
+			if ((s0 > 0) != (s3 > 0)) {
 				v3s _0 = {lx-1, ly-1, lz};
 				v3s _1 = {lx+0, ly-1, lz};
 				v3s _2 = {lx-1, ly+0, lz};
 				v3s _3 = {lx+0, ly+0, lz};
 
-				if (!(sdf(lx,ly,lz) > 0)) {
+				if (!(s0 > 0)) {
 					swap(_0, _3);
 				}
 
-				add(_0);
-				add(_1);
-				add(_2);
-				add(_1);
-				add(_3);
-				add(_2);
+				quad(_0, _1, _2, _3);
 			}
+			int cpp_debugging_is_great = 42;
 		}
 		}
 		}
@@ -1536,7 +1627,7 @@ void sdf_to_triangles(v3s lbounds, auto &&sdf, auto &&modify_point, auto &&add_v
 using ChunkVertexArena = StaticList<ChunkVertex, 1024*1024>;
 
 template <u32 lodw>
-void generate_chunk_lod(Chunk *chunk, v3s chunk_position, ChunkVertexArena &vertices) {
+void generate_chunk_lod(Chunk *chunk, v3s chunk_position, ChunkVertexArena &vertices, Span<ChunkVertex> parent_vertices) {
 	v3s lbounds = V3s(lodw);
 	if constexpr (lodw <= 2) {
 		if (chunk->neighbor_mask.x) lbounds.x += 2;
@@ -1592,25 +1683,54 @@ void generate_chunk_lod(Chunk *chunk, v3s chunk_position, ChunkVertexArena &vert
 
 	u32 start_vertex = vertices.count;
 
+	StaticList<ChunkVertex, 1024*1024> unique_vertices;
+	StaticList<u32, 1024*1024> indices;
+
 	sdf_to_triangles<lodw>(lbounds, sdf,
-		[&](v3f point) {
-			point *= CHUNKW/lodw;
-			point += 0.5f * (1 << (log2(CHUNKW) - log2(lodw))) - 0.5f;
-			return point;
-		},
 		[&](ChunkVertex vertex) {
-			vertices.add(vertex);
+			vertex.position *= CHUNKW/lodw;
+			vertex.position += 0.5f * (1 << (log2(CHUNKW) - log2(lodw))) - 0.5f;
+			unique_vertices.add(vertex);
+		},
+		[&](u32 i) {
+			vertices.add(unique_vertices[i]);
+			indices.add(i);
 		}
 	);
+
+#if 0
+	for (auto &vertex : vertices) {
+		f32 mind = max_value<f32>;
+		ChunkVertex closest = vertex;
+		for (auto &parent_vertex : parent_vertices) {
+			f32 d = distance(vertex.position, parent_vertex.position);
+			if (mind > d) {
+				mind = d;
+				closest = parent_vertex;
+			}
+		}
+		vertex.parent_position = closest.position;
+		vertex.parent_normal = closest.normal;
+	}
+#endif
+
+	auto vertex_count = vertices.count - start_vertex;
 
 	auto lod_index = log2(CHUNKW) - log2(lodw);
 
 	chunk->sdf_vb_vertex_offset[lod_index] = start_vertex;
-	chunk->sdf_vb_vertex_count [lod_index] = vertices.count - start_vertex;
+	chunk->sdf_vb_vertex_count [lod_index] = vertex_count;
 
-	if (lod_index == 0) {
-		for (u32 i = start_vertex; i != vertices.count; ++i)
-			chunk->sdf_vertex_positions.add(vertices[i].position);
+	// NOTE: physics are really slow with lod0
+	if (lod_index == 1) {
+		chunk->physics_vertices.clear();
+		chunk->physics_indices.clear();
+		for (auto &v : unique_vertices) {
+			chunk->physics_vertices.add({v.position, decode_normal(v.normal)});
+		}
+		for (auto i : indices) {
+			chunk->physics_indices.add(i);
+		}
 	}
 
 	chunk->frames_since_remesh = 0;
@@ -1619,22 +1739,28 @@ void generate_chunk_lod(Chunk *chunk, v3s chunk_position, ChunkVertexArena &vert
 void update_chunk_mesh(Chunk *chunk, v3s chunk_position) {
 	timed_function(profiler, profile_frame);
 
-#if DEBUG_CHUNK_THREAD_ACCESS
 	u32 locked_by;
 	if (!try_lock(chunk->mutex, &locked_by)) {
 		with(ConsoleColor::red, print("Attempt to access the same chunk from different threads: {} and {}\n", locked_by, get_current_thread_id()));
 		invalid_code_path("shared chunk access must not happen!");
 	}
 	defer { unlock(chunk->mutex); };
-#endif
 
 	ChunkVertexArena vertices;
-	generate_chunk_lod<1 >(chunk, chunk_position, vertices);
-	generate_chunk_lod<2 >(chunk, chunk_position, vertices);
-	generate_chunk_lod<4 >(chunk, chunk_position, vertices);
-	generate_chunk_lod<8 >(chunk, chunk_position, vertices);
-	generate_chunk_lod<16>(chunk, chunk_position, vertices);
-	generate_chunk_lod<32>(chunk, chunk_position, vertices);
+	Span<ChunkVertex> prev_lod;
+
+	auto do_lod = [&]<umm lodw>() {
+		auto start = vertices.end();
+		generate_chunk_lod<lodw>(chunk, chunk_position, vertices, prev_lod);
+		prev_lod = {start, vertices.end()};
+	};
+
+	do_lod.operator()<1 >();
+	do_lod.operator()<2 >();
+	do_lod.operator()<4 >();
+	do_lod.operator()<8 >();
+	do_lod.operator()<16>();
+	do_lod.operator()<32>();
 
 
 	if (vertices.count) {
@@ -1648,11 +1774,11 @@ void start() {
 
 }
 
-FrustumPlanes frustum;
+bool chunk_in_view(FrustumPlanes frustum, v3s position, f32 radius_scale = 1.0f) {
+	auto relative_position = (v3f)((position - current_world_origin)*CHUNKW);
 
-bool chunk_in_view(v3s position) {
-	auto relative_position = (v3f)((position-camera->position.chunk)*CHUNKW);
-	return contains_sphere(frustum, relative_position+V3f(CHUNKW/2), sqrt3*CHUNKW);
+	f32 const radius = CHUNKW * sqrt3 * 0.5f * radius_scale;
+	return contains_sphere(frustum, relative_position+V3f(CHUNKW/2), radius);
 }
 
 extern "C" const Array<v3s8, pow3(DRAWD*2+1)> grid_map;
@@ -1666,10 +1792,10 @@ u32 fully_meshed_chunk_index_end = 0;
 s32 n_sdfs_can_generate_this_frame;
 u32 remesh_count = 0;
 
-s32 get_chunk_lod_index(v3s p) {
+f32 get_chunk_lod_t(v3s p) {
 	//auto distance = max(absolute(p - camera->position.chunk));
-	auto distance = length((v3f)(p - camera->position.chunk) * CHUNKW - camera->position.local) / CHUNKW;
-	return log2((s32)max(distance, 1));
+	auto distance = length((v3f)(p - camera->position.chunk) + 0.5f - camera->position.local/CHUNKW);
+	return log2(max(distance, 1));
 }
 
 void remesh_blocks(Chunk *chunk) {
@@ -1750,6 +1876,19 @@ void remesh_blocks(Chunk *chunk) {
 	update_chunk_mask(chunk, get_chunk_position(chunk));
 }
 
+void free_physics(Chunk *chunk) {
+	if (chunk->body) {
+		physics_world->destroyRigidBody(chunk->body);
+		chunk->body = 0;
+
+		physics.destroyTriangleMesh(chunk->triangle_mesh);
+		chunk->triangle_mesh = 0;
+
+		physics.destroyConcaveMeshShape(chunk->shape);
+		chunk->shape = 0;
+	}
+}
+
 void generate_chunks_around() {
 	auto generate_timer = create_precise_timer();
 	defer { generate_time.set(get_time(generate_timer)); };
@@ -1774,7 +1913,8 @@ void generate_chunks_around() {
 	// n_sdfs_can_generate_this_frame = 4;
 
 	f32 update_time_except_gen_time = frame_time - generate_time.current;
-	assert(update_time_except_gen_time >= 0);
+	// Dude what? How can this fail.
+	// assert(update_time_except_gen_time >= 0);
 
 	f32 available_time = max(0, target_frame_time - update_time_except_gen_time);
 
@@ -1785,22 +1925,22 @@ void generate_chunks_around() {
 
 	auto work = make_work_queue(thread_pool);
 
-	if (any_true(camera_chunk_last_frame != camera->position.chunk)) {
+	if (any_true(current_world_origin != last_world_origin)) {
 		timed_block(profiler, profile_frame, "remove chunks");
 		first_not_generated_sdf_chunk_index = 0;
 		first_not_fully_meshed_chunk_index = 0;
 
-		for (s32 x = camera_chunk_last_frame.x-DRAWD; x <= camera_chunk_last_frame.x+DRAWD; ++x) {
-		for (s32 y = camera_chunk_last_frame.y-DRAWD; y <= camera_chunk_last_frame.y+DRAWD; ++y) {
-		for (s32 z = camera_chunk_last_frame.z-DRAWD; z <= camera_chunk_last_frame.z+DRAWD; ++z) {
-			if (camera->position.chunk.x-DRAWD <= x && x <= camera->position.chunk.x+DRAWD)
-			if (camera->position.chunk.y-DRAWD <= y && y <= camera->position.chunk.y+DRAWD)
-			if (camera->position.chunk.z-DRAWD <= z && z <= camera->position.chunk.z+DRAWD)
+		for (s32 x = last_world_origin.x-DRAWD; x <= last_world_origin.x+DRAWD; ++x) {
+		for (s32 y = last_world_origin.y-DRAWD; y <= last_world_origin.y+DRAWD; ++y) {
+		for (s32 z = last_world_origin.z-DRAWD; z <= last_world_origin.z+DRAWD; ++z) {
+			if (current_world_origin.x-DRAWD <= x && x <= current_world_origin.x+DRAWD)
+			if (current_world_origin.y-DRAWD <= y && y <= current_world_origin.y+DRAWD)
+			if (current_world_origin.z-DRAWD <= z && z <= current_world_origin.z+DRAWD)
 				continue;
 
 			auto chunk_position = v3s{x,y,z};
 
-			auto r = absolute(chunk_position - camera->position.chunk);
+			auto r = absolute(chunk_position - current_world_origin);
 			assert(r.x > DRAWD || r.y > DRAWD || r.z > DRAWD);
 			auto chunk = get_chunk(chunk_position);
 
@@ -1833,8 +1973,10 @@ void generate_chunks_around() {
 			chunk->has_surface = false;
 			chunk->sdf_generated = false;
 			chunk->neighbor_mask = {};
+			chunk->sdf_mesh_generated = false;
 
 			free(chunk->trees_instances_buffer);
+			chunk->trees.clear();
 
 			if (chunk->needs_saving) {
 				chunk->needs_saving = false;
@@ -1849,9 +1991,13 @@ void generate_chunks_around() {
 				free_blocks(chunk);
 			}
 
-			free(chunk->sdf_vertex_positions);
+			// NOTE: keep allocated buffer.
+			// free(chunk->physics_vertices);
+			// free(chunk->physics_indices);
 
 			chunk->lod_t = 1;
+
+			free_physics(chunk);
 		}
 		}
 		}
@@ -1871,24 +2017,38 @@ void generate_chunks_around() {
 			for (s32 x = 0; x < dim; ++x) {
 			for (s32 y = 0; y < dim; ++y) {
 			for (s32 z = 0; z < dim; z += 8) {
-				auto d = f32x8_clamp(sdf_func_x8((v3s{x,y,z} + camera->position.chunk - dim/2)*CHUNKW, CHUNKW), f32x8_set1(-128), f32x8_set1(127));
-				for (u32 i = 0; i < 8; ++i)
-					sdf[x][y][z+i] = (s8)d.m256_f32[i];
+				v3s p = v3s{x,y,z} + current_world_origin - dim/2;
+
+				auto d = f32x8_clamp(sdf_func_x8(p*CHUNKW, CHUNKW), f32x8_set1(-128), f32x8_set1(127));
+				for (s32 i = 0; i < 8; ++i) {
+					v3s l = {p.x,p.y,p.z+i};
+					if (all_true(current_world_origin - DRAWD <= l && l <= current_world_origin + DRAWD) && get_chunk(l)->sdf_mesh_generated) {
+						sdf[x][y][z+i] = -128;
+					} else {
+						if (auto found = saved_chunks.find(l)) {
+							sdf[x][y][z+i] = found->value.sdf[0][0][0];
+						} else {
+							sdf[x][y][z+i] = (s8)d.m256_f32[i];
+						}
+					}
+				}
 			}
 			}
 			}
+
+			StaticList<ChunkVertex, 1024*1024> unique_vertices;
 
 			sdf_to_triangles<dim>(V3s(dim),
 				[&](s32 x, s32 y, s32 z) {
 					return sdf[x][y][z];
 				},
-				[&](v3f point) {
-					point = (point - dim/2) * CHUNKW;
-					//point += 8;
-					return point;
-				},
 				[&](ChunkVertex vertex) {
-					vertices.add(vertex);
+					vertex.position = (vertex.position - dim/2) * CHUNKW;
+					//point += 8;
+					unique_vertices.add(vertex);
+				},
+				[&](u32 i) {
+					vertices.add(unique_vertices[i]);
 				}
 			);
 
@@ -1897,7 +2057,11 @@ void generate_chunks_around() {
 				farlands_vb.view = create_structured_buffer(vertices.span());
 			}
 		}
+
 	}
+
+	List<Chunk *> chunks_that_need_collision_update;
+	chunks_that_need_collision_update.allocator = temporary_allocator;
 
 	{
 		timed_block(profiler, profile_frame, "generate sdfs");
@@ -1913,11 +2077,11 @@ void generate_chunks_around() {
 			auto &p_small = *pp_small;
 			auto p = (v3s)p_small;
 			auto p_index = pp_small - grid_map.data;
-			auto chunk_position = camera->position.chunk + p;
+			auto chunk_position = current_world_origin + p;
 			auto chunk = get_chunk(chunk_position);
 			if (chunk->sdf_generated) {
 				if (chunk->needs_filter_and_remesh) {
-					// always update requested remeshes
+					// Chunk was changed by somebody
 					chunk->needs_filter_and_remesh = false;
 					work.push([chunk = chunk, chunk_position] {
 						filter_sdf(chunk);
@@ -1925,18 +2089,23 @@ void generate_chunks_around() {
 						update_chunk_mask(chunk, chunk_position);
 					});
 					remesh_count++;
+					free_physics(chunk);
+					chunks_that_need_collision_update.add(chunk);
 				} else {
 					if (remesh_count < n_sdfs_can_generate_this_frame) {
 						auto new_neighbor_mask = get_neighbor_mask(chunk_position);
-						auto r = chunk_position == camera->position.chunk + DRAWD;
+						auto r = chunk_position == current_world_origin + DRAWD;
 						if (chunk->neighbor_mask != new_neighbor_mask) {
 							if ((new_neighbor_mask.x || r.x) && (new_neighbor_mask.y || r.y) && (new_neighbor_mask.z || r.z)) {
+								// All neighbors are generated and full mesh can be created
 								chunk->neighbor_mask = new_neighbor_mask;
 								work.push([chunk, chunk_position] {
 									update_chunk_mesh(chunk, chunk_position);
 									update_chunk_mask(chunk, chunk_position);
 								});
 								remesh_count++;
+								free_physics(chunk);
+								chunks_that_need_collision_update.add(chunk);
 							}
 						}
 					}
@@ -1950,7 +2119,7 @@ void generate_chunks_around() {
 				if (n_sdfs_generated < n_sdfs_can_generate_this_frame) {
 					n_sdfs_generated += 1;
 
-					chunk->lod_previous_frame = get_chunk_lod_index(chunk_position);
+					chunk->lod_previous_frame = (u32)get_chunk_lod_t(chunk_position);
 
 					if (auto found = saved_chunks.find(chunk_position)) {
 						work.push([chunk = chunk, chunk_position, found]{
@@ -1985,7 +2154,7 @@ void generate_chunks_around() {
 
 			bool has_full_mesh = false;
 			if (chunk->sdf_generated) {
-				auto e = chunk_position == camera->position.chunk + DRAWD;
+				auto e = chunk_position == current_world_origin + DRAWD;
 				// Chunks that are not on the edge must have all neighbors.
 				// Mesh of the chunk on the edge of draw distance in positive X/Y/Z direction(s)
 				// will be considered full without the neighbor in that direction(s).
@@ -2017,9 +2186,9 @@ void generate_chunks_around() {
 		for (auto pp_small = grid_map.begin() + first_not_fully_meshed_chunk_index; pp_small != grid_map.begin() + iter_from_center_offset_sdf_end; ++pp_small) {
 			auto &p_small = *pp_small;
 			auto p = (v3s)p_small;
-			auto chunk_position = camera->position.chunk + p;
+			auto chunk_position = current_world_origin + p;
 
-			auto lod_index = get_chunk_lod_index(p);
+			auto lod_index = (u32)get_chunk_lod_t(p);
 
 			//if (visible)
 			//	if (lodw == 32)
@@ -2033,7 +2202,7 @@ void generate_chunks_around() {
 			}
 
 			bool has_full_mesh =
-				any_true(chunk_position == camera->position.chunk + DRAWD) ?
+				any_true(chunk_position == current_world_origin + DRAWD) ?
 				chunk.sdf_generated && (chunk.neighbor_mask.x || chunk.neighbor_mask.y || chunk.neighbor_mask.z) : // these are on the edge of draw distance, they will never have neighbors therefore full mesh
 				chunk.sdf_generated && chunk.neighbor_mask.x && chunk.neighbor_mask.y && chunk.neighbor_mask.z; //
 
@@ -2053,6 +2222,45 @@ void generate_chunks_around() {
 		timed_block(profiler, profile_frame, "wait_for_completion");
 		work.wait_for_completion();
 	}
+
+	for (auto chunk : chunks_that_need_collision_update) {
+		if (chunk->physics_indices.count) {
+			auto chunk_position = get_chunk_position(chunk);
+			chunk->body = physics_world->createRigidBody({{}, p::Quaternion::identity()});
+			chunk->body->setType(p::BodyType::STATIC);
+			chunk->triangle_mesh = physics.createTriangleMesh();
+#if 1
+			new (&chunk->subpart) p::TriangleVertexArray(
+				chunk->physics_vertices.count,
+				&chunk->physics_vertices[0].position, sizeof(chunk->physics_vertices[0]),
+				chunk->physics_indices.count/3, &chunk->physics_indices[0], sizeof(chunk->physics_indices[0])*3,
+				p::TriangleVertexArray::VertexDataType::VERTEX_FLOAT_TYPE,
+				p::TriangleVertexArray::IndexDataType::INDEX_INTEGER_TYPE
+			);
+#else
+			new (&chunk->subpart) p::TriangleVertexArray(
+				chunk->physics_vertices.count,
+				&chunk->physics_vertices[0].position, sizeof(chunk->physics_vertices[0]),
+				&chunk->physics_vertices[0].normal, sizeof(chunk->physics_vertices[0]),
+				chunk->physics_indices.count/3, &chunk->physics_indices[0], sizeof(chunk->physics_indices[0])*3,
+				p::TriangleVertexArray::VertexDataType::VERTEX_FLOAT_TYPE,
+				p::TriangleVertexArray::NormalDataType::NORMAL_FLOAT_TYPE,
+				p::TriangleVertexArray::IndexDataType::INDEX_INTEGER_TYPE
+			);
+#endif
+			chunk->triangle_mesh->addSubpart(&chunk->subpart);
+			chunk->shape = physics.createConcaveMeshShape(chunk->triangle_mesh);
+			chunk->body->addCollider(chunk->shape, {});
+
+			aabb<v3f> box {
+				{-1,  0, -1},
+				{ 1, 20,  1},
+			};
+			for (auto &tree : chunk->trees) {
+				chunk->body->addCollider(physics.createBoxShape(to_pv(box.size() / 2)), {to_pv(tree.position + box.center()), p::Quaternion::identity()});
+			}
+		}
+	}
 }
 
 struct RayHit {
@@ -2067,8 +2275,6 @@ struct RayHit {
 
 RayHit global_raycast(ChunkRelativePosition origin_crp, v3f direction, f32 max_distance) {
 	timed_function(profiler, profile_frame);
-
-	origin_crp.ensure_valid();
 
 	RayHit result = {};
 
@@ -2099,10 +2305,10 @@ RayHit global_raycast(ChunkRelativePosition origin_crp, v3f direction, f32 max_d
 				auto b = chunk.vertices[chunk.indices[i+1]];
 				auto c = chunk.vertices[chunk.indices[i+2]];
 #else
-			for (u32 i = 0; i < chunk->sdf_vertex_positions.count; i += 3) {
-				auto a = chunk->sdf_vertex_positions[i+0];
-				auto b = chunk->sdf_vertex_positions[i+1];
-				auto c = chunk->sdf_vertex_positions[i+2];
+			for (u32 i = 0; i < chunk->physics_indices.count; i += 3) {
+				auto a = chunk->physics_vertices[chunk->physics_indices[i+0]].position;
+				auto b = chunk->physics_vertices[chunk->physics_indices[i+1]].position;
+				auto c = chunk->physics_vertices[chunk->physics_indices[i+2]].position;
 #endif
 
 				if (auto hit = raycast(ray, triangle{a,b,c})) {
@@ -2253,6 +2459,26 @@ void add_sdf_sphere(ChunkRelativePosition position, s32 radius, s32 strength) {
 		auto chunk = get_chunk(x,y,z);
 		if (chunk->sdf_generated) {
 			mark_chunk_sdf_modified(chunk);
+
+			for (auto &tree : chunk->trees) {
+				auto tree_entity = create_entity();
+				tree_entity->position.chunk = {x,y,z};
+				tree_entity->position.local = tree.position;
+
+				tree_entity->rotation = tree.rotation;
+
+				auto &physics = tree_entity->add_component<PhysicsComponent>();
+				physics.set_box_shape({{-1,0,-1},{1,20,1}});
+
+				auto &mesh = tree_entity->add_component<MeshComponent>();
+				mesh.model = &tree_model;
+
+				auto &remover = tree_entity->add_component<RemoverComponent>();
+				remover.time_left = 10;
+			}
+			chunk->trees.clear();
+
+			free(chunk->trees_instances_buffer);
 		}
 	}
 	}
@@ -2473,16 +2699,22 @@ void add_sdf_sphere_synchronized(ChunkRelativePosition position, s32 brush_size,
 	});
 }
 
+void draw_vertices(u32 vertex_count, u32 start_vertex = 0) {
+	immediate_context->Draw(vertex_count, start_vertex);
+	++draw_call_count;
+}
+
+void draw_indexed(u32 index_count, u32 start_index = 0, u32 start_vertex = 0) {
+	immediate_context->DrawIndexed(index_count, start_index, start_vertex);
+	++draw_call_count;
+}
+
 void draw_text(Span<utf8> str, u32 size, v2f position, bool ndc_position = false) {
 	auto font = get_font_at_size(font_collection, size);
 	ensure_all_chars_present(str, font);
 	auto placed_chars = place_text(str, font);
 	defer { free(placed_chars); };
 
-	if (font_vertex_buffer) {
-		font_vertex_buffer->Release();
-		font_vertex_buffer = 0;
-	}
 	{
 		StaticList<FontVertex, 1024*1024> vertices;
 
@@ -2508,16 +2740,20 @@ void draw_text(Span<utf8> str, u32 size, v2f position, bool ndc_position = false
 				v.position = map(v.position + position, v2f{}, (v2f)window_client_size, v2f{-1, 1}, v2f{1,-1});
 		}
 
+		if (font_vertex_buffer) {
+			font_vertex_buffer->Release();
+			font_vertex_buffer = 0;
+		}
 		font_vertex_buffer = create_structured_buffer(vertices.span());
 
 		immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 		immediate_context->VSSetShaderResources(0, 1, &font_vertex_buffer);
 		immediate_context->PSSetShaderResources(0, 1, &font->texture);
-		immediate_context->VSSetShader(font_vs, 0, 0);
-		immediate_context->PSSetShader(font_ps, 0, 0);
+		immediate_context->VSSetShader(shaders.font_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.font_ps, 0, 0);
 		immediate_context->OMSetBlendState(font_blend, {}, -1);
 
-		immediate_context->Draw(vertices.count, 0);
+		draw_vertices(vertices.count);
 	}
 }
 
@@ -2526,11 +2762,78 @@ List<utf8> allocation_info_string;
 PreciseTimer the_timer;
 u32 frame_number;
 
+List<Profiler::TimeSpan> previous_frame_profile;
+
+struct GpuTimeQuery {
+	ID3D11Query *disjoint;
+	ID3D11Query *start;
+	ID3D11Query *end;
+	char const *name;
+};
+
+ID3D11Query *create_query(D3D11_QUERY kind) {
+	D3D11_QUERY_DESC desc {
+		.Query = kind,
+	};
+	ID3D11Query *query;
+	dhr(device->CreateQuery(&desc, &query));
+	return query;
+}
+
+GpuTimeQuery start_gpu_timer() {
+	GpuTimeQuery query = {};
+	query.disjoint = create_query(D3D11_QUERY_TIMESTAMP_DISJOINT);
+	query.start    = create_query(D3D11_QUERY_TIMESTAMP);
+	query.end      = create_query(D3D11_QUERY_TIMESTAMP);
+
+	immediate_context->Begin(query.disjoint);
+	immediate_context->End(query.start);
+	return query;
+}
+
+void stop_gpu_timer(GpuTimeQuery query) {
+	immediate_context->End(query.end);
+	immediate_context->End(query.disjoint);
+}
+
+struct GpuTime {
+	u64 start;
+	u64 end;
+	u64 frequency;
+};
+
+GpuTime get_gpu_time(GpuTimeQuery query) {
+    UINT64 start_time = 0;
+    while(immediate_context->GetData(query.start, &start_time, sizeof(start_time), 0) != S_OK);
+
+    UINT64 end_time = 0;
+    while(immediate_context->GetData(query.end, &end_time, sizeof(end_time), 0) != S_OK);
+
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint_data;
+    while(immediate_context->GetData(query.disjoint, &disjoint_data, sizeof(disjoint_data), 0) != S_OK);
+
+	if (disjoint_data.Disjoint)
+		return {};
+
+	return {
+		.start = start_time,
+		.end = end_time,
+		.frequency = disjoint_data.Frequency,
+	};
+}
+
+List<GpuTimeQuery> gpu_time_queries;
+
 void update() {
 	is_connected = another_thread_is_connected;
 
-	// NOTE: all camera->position modifications must happen AFTER saving position at previous frame.
-	camera_chunk_last_frame = camera->position.chunk;
+	v3s new_world_origin = current_world_origin;
+	defer {
+		last_world_origin = current_world_origin;
+		current_world_origin = new_world_origin;
+	};
+
+	new_world_origin = camera->position.chunk;
 
 	timed_function(profiler, profile_frame);
 
@@ -2550,16 +2853,32 @@ void update() {
 			debug_selected_lod += 1;
 	}
 	if (key_down(Key_minus)) {
-		if (chunk_generation_amount_factor != 1)
+		if (chunk_generation_amount_factor == 1)
+			chunk_generation_amount_factor = 0;
+		else if (chunk_generation_amount_factor != 1)
 			chunk_generation_amount_factor /= 2;
 	}
 	if (key_down(Key_plus)) {
-		if (chunk_generation_amount_factor != 64)
+		if (chunk_generation_amount_factor == 0)
+			chunk_generation_amount_factor = 1;
+		else if (chunk_generation_amount_factor != 64)
 			chunk_generation_amount_factor *= 2;
 	}
 
 	if (key_down(Key_left_bracket )) draw_grass = !draw_grass;
 	if (key_down(Key_right_bracket)) draw_trees = !draw_trees;
+
+	if (key_down(Key_semicolon)) {
+		draw_collision_shape = !draw_collision_shape;
+		physics_world->getDebugRenderer().setIsDebugItemDisplayed(p::DebugRenderer::DebugItem::COLLISION_SHAPE, draw_collision_shape);
+	}
+
+	if (key_down(Key_comma)) {
+		draw_mode = (draw_mode == 0 ? DRAW_MODE_COUNT : draw_mode) - 1;
+	}
+	if (key_down(Key_period)) {
+		draw_mode = (draw_mode == DRAW_MODE_COUNT-1 ? 0 : draw_mode+1);
+	}
 
 	v3f camera_position_delta {
 		key_held(Key_d) - key_held(Key_a),
@@ -2587,25 +2906,29 @@ void update() {
 
 
 	if (key_down('H')) {
-		camera->position = camera_prev_position = {0,1,0};
+		camera->position = {0,1,0};
+	}
+	if (key_down('J')) {
+		camera->position.chunk.x *= 2;
 	}
 
 	{
 		switch (camera_mode) {
 			case CameraMode::fly: {
-				camera_prev_position = camera->position;
-				camera->position += camera_rotation * camera_position_delta * target_frame_time * 32 * (key_held(Key_shift) ? 10 : 1);
+				camera->position += camera_rotation * camera_position_delta * frame_time * 32 * (key_held(Key_shift) ? 10 : 1);
 
 				if (key_down('F')) {
 					camera_mode = CameraMode::walk;
-					camera_prev_position = camera->position;
+					camera->get_component<PhysicsComponent>()->body->setIsActive(true);
 				}
 				break;
 			}
 			case CameraMode::walk: {
-				camera->position += m4::rotation_r_y(camera_angles.y) * camera_position_delta * v3f{1,0,1} * target_frame_time * (key_held(Key_shift) ? 2 : 1);
+				/*
+				auto xz_delta = m4::rotation_r_y(camera_angles.y) * camera_position_delta * v3f{1,0,1} * frame_time * (key_held(Key_shift) ? 2 : 1);
+				camera->position += xz_delta;
 				if (key_down(' '))
-					camera->position += v3f{0,target_frame_time*7,0};
+					camera->position += v3f{0,frame_time*7,0};
 
 				//auto velocity = (camera->position - camera_prev_position).to_v3f();
 
@@ -2629,7 +2952,23 @@ void update() {
 					{+player_radius, player_height-camera_height, +player_radius},
 				});
 
+				*/
+
+				auto ph = camera->get_component<PhysicsComponent>();
+
+				auto xz_delta = m4::rotation_r_y(camera_angles.y) * camera_position_delta * v3f{1,0,1} * 100 * (key_held(Key_shift) ? 2 : 1);
+				ph->body->applyWorldForceAtCenterOfMass(to_pv(xz_delta));
+				auto vel = ph->body->getLinearVelocity();
+				vel.x *= 0.5f;
+				vel.z *= 0.5f;
+				ph->body->setLinearVelocity(vel);
+
+
+				if (key_down(' '))
+					ph->body->applyWorldForceAtCenterOfMass({0,700,0});
+
 				if (key_down('F')) {
+					ph->body->setIsActive(false);
 					camera_mode = CameraMode::fly;
 				}
 				break;
@@ -2657,11 +2996,6 @@ ENUMERATE_COMPONENTS
 		print("sent end_chunk_transfer\n");
 	}
 #endif
-
-	auto rotproj = m4::perspective_left_handed((f32)window_client_size.x / window_client_size.y, radians(camera_fov), 0.1, CHUNKW * FARD) * m4::rotation_r_yxz(-camera_angles);
-	auto camera_matrix = rotproj * m4::translation(-camera->position.local);
-
-	frustum = create_frustum_planes_d3d(camera_matrix);
 
 	struct BrushStroke {
 		ChunkRelativePosition position;
@@ -2760,19 +3094,20 @@ ENUMERATE_COMPONENTS
 	if (key_down('1')) { belt_item_index = 1; }
 	if (key_down('2')) { belt_item_index = 2; }
 
-	if (mouse_held(2)) {
-		auto &grenade_entity = create_entity();
-		grenade_entity.position = camera->position + camera_forward;
+	if (mouse_down(2)) {
+		auto grenade_entity = create_entity();
+		grenade_entity->position = camera->position + camera_forward;
 
-		auto &grenade = grenade_entity.add_component<GrenadeComponent>();
-		grenade.timer = 3;
+		auto &grenade = grenade_entity->add_component<GrenadeComponent>();
 
-		auto &physics = grenade_entity.add_component<PhysicsComponent>();
-		physics.set_velocity(camera_forward * 50);
-		//physics.collision_box = {
-		//	V3f(-.2),
-		//	V3f(+.2),
-		//};
+		auto &remover = grenade_entity->add_component<RemoverComponent>();
+		remover.time_left = 3;
+
+		auto &physics = grenade_entity->add_component<PhysicsComponent>();
+		physics.set_velocity(camera_forward*50);
+
+		auto &mesh = grenade_entity->add_component<MeshComponent>();
+		mesh.model = &grenade_model;
 	}
 
 	if (key_held('C')) {
@@ -2784,7 +3119,7 @@ sdf_vb_vertex_offset: {}
 grass_vb: {}
 blocks_vb: {}
 trees_instances_buffer: {}
-sdf_vertex_positions.count: {}
+physics_vertices.count: {}
 sdf: {}
 blocks: {}
 lod_previous_frame: {}
@@ -2806,7 +3141,7 @@ chunk->sdf_vb_vertex_offset,
 chunk->grass_vb,
 chunk->blocks_vb,
 chunk->trees_instances_buffer,
-chunk->sdf_vertex_positions.count,
+chunk->physics_vertices.count,
 chunk->sdf,
 chunk->blocks,
 chunk->lod_previous_frame,
@@ -2828,6 +3163,7 @@ sdf_at_interpolated(camera->position)
 		update_allocations = !update_allocations;
 	}
 
+	free(allocation_info_string);
 	if (update_allocations) {
 		StringBuilder builder;
 		defer { free(builder); };
@@ -2837,7 +3173,6 @@ sdf_at_interpolated(camera->position)
 			append_format(builder, "{}: {} | {}\n", location, format_bytes(info.current_size), format_bytes(info.total_size));
 		});
 
-		free(allocation_info_string);
 		allocation_info_string = (List<utf8>)to_string(builder);
 	}
 
@@ -2861,13 +3196,16 @@ sdf_at_interpolated(camera->position)
 	//}
 
 
+	//
+	// REMOVE QUEUED ENTITIES
+	//
 
 	for (auto entity : entities_to_remove) {
 		for (auto &component_index : entity->components) {
 			switch (component_index.component_type) {
 #define e(name) \
 	case name##_index: \
-		components<name>.at(component_index.component_index).on_destroy(); \
+		components<name>.at(component_index.component_index).on_free(); \
 		components<name>.erase_at(component_index.component_index); \
 		break;
 ENUMERATE_COMPONENTS
@@ -2881,25 +3219,99 @@ ENUMERATE_COMPONENTS
 
 
 	//
+	// PHYSICS
+	//
+	for (u64 mask_index = 0; mask_index != count_of(nonempty_chunk_mask); ++mask_index) {
+		auto mask = nonempty_chunk_mask[mask_index];
+		if (mask == 0)
+			continue;
+
+		for (u64 bit_index = 0; bit_index != 64; ++bit_index) {
+			if (mask & ((u64)1 << bit_index)) {
+				auto chunk_position = get_chunk_position(mask_index * bits_in_chunk_mask + bit_index);
+				auto chunk = get_chunk(chunk_position);
+				auto relative_position = (v3f)((chunk_position-current_world_origin)*CHUNKW);
+
+				if (chunk->body) {
+					chunk->body->setTransform({to_pv(relative_position), p::Quaternion::identity()});
+					//chunk->body->setTransform({to_pv((v3f)chunk_position * CHUNKW), p::Quaternion::identity()});
+				}
+			}
+		}
+	}
+
+	for (auto &comp : components<PhysicsComponent>) {
+		auto relative_position = comp.entity->position;
+		relative_position.chunk -= current_world_origin;
+
+		comp.body->setTransform({
+				to_pv(relative_position.to_v3f()),
+				comp.entity->rotation
+			},
+			false
+		);
+	}
+
+	static f32 physics_time = 0;
+	physics_time += frame_time;
+	for (u32 iters = 0; iters < 4 && physics_time >= target_frame_time; ++iters) {
+		physics_time -= target_frame_time;
+		physics_world->update(target_frame_time);
+	}
+	for (auto &comp : components<PhysicsComponent>) {
+		comp.entity->position.chunk = current_world_origin;
+		comp.entity->position.local = to_v3f(comp.body->getTransform().getPosition());
+		comp.entity->position.normalize();
+
+		comp.entity->rotation = comp.body->getTransform().getOrientation();
+	}
+
+
+	//
 	// GRAPHICS
 	//
 
+	draw_call_count = 0;
+	if (profile_frame)
+		gpu_time_queries.clear();
 
 	immediate_context->VSSetConstantBuffers(0, 1, &frame_cbuffer.cbuffer);
 	immediate_context->PSSetConstantBuffers(0, 1, &frame_cbuffer.cbuffer);
-	immediate_context->VSSetConstantBuffers(1, 1, &chunk_cbuffer.cbuffer);
-	immediate_context->PSSetConstantBuffers(1, 1, &chunk_cbuffer.cbuffer);
+	immediate_context->VSSetConstantBuffers(1, 1, &entity_cbuffer.cbuffer);
+	immediate_context->PSSetConstantBuffers(1, 1, &entity_cbuffer.cbuffer);
 	immediate_context->PSSetSamplers(DEFAULT_SAMPLER_SLOT, 1, &default_sampler_wrap);
 
 	StaticList<Chunk *, pow3(DRAWD*2+1)> visible_chunks;
 
 	u32 num_masks_skipped = 0;
 
+#define scoped_gpu_timer(_name) \
+	timed_block(profiler, profile_frame, _name); \
+	GpuTimeQuery gpu_timer; \
+	if (profile_frame) { \
+		gpu_timer = start_gpu_timer(); \
+		gpu_timer.name = _name; \
+	} \
+	defer { \
+		if (profile_frame) { \
+			stop_gpu_timer(gpu_timer); \
+			gpu_time_queries.add(gpu_timer); \
+		} \
+	};
+
+	auto camera_position_relative_to_origin = relative_to_origin(camera->position);
+
+	auto rotproj = m4::perspective_left_handed((f32)window_client_size.x / window_client_size.y, radians(camera_fov), 0.1, CHUNKW * FARD) * m4::rotation_r_yxz(-camera_angles);
+	auto camera_matrix = rotproj * m4::translation(-camera_position_relative_to_origin);
+
+	auto camera_frustum = create_frustum_planes_d3d(camera_matrix);
+
 	//
 	// SHADOWS
 	//
 	{
-		timed_block(profiler, profile_frame, "shadows");
+		scoped_gpu_timer("shadows");
+
 		//frame_cbuffer.update({
 		//	.mvp = camera_matrix,
 		//	.rotproj = rotproj,
@@ -2913,16 +3325,17 @@ ENUMERATE_COMPONENTS
 		v3f light_dir = light_rotation * v3f{0,0,-1};
 
 		f32 const shadow_pixels_in_meter = (f32)shadow_map_size / shadow_world_size / 2;
+		f32 const snap_size = shadow_pixels_in_meter;
 
 		auto lightr = m4::rotation_r_yxz(-light_angles);
 
 		v3f lightpos = camera->position.to_v3f();
 		lightpos = lightr * lightpos;
-		lightpos *= shadow_pixels_in_meter;
+		lightpos *= snap_size;
 		lightpos = round(lightpos);
-		lightpos /= shadow_pixels_in_meter;
+		lightpos /= snap_size;
 		lightpos = inverse(lightr) * lightpos;
-		lightpos -= (v3f)(camera->position.chunk * CHUNKW);
+		lightpos -= (v3f)(current_world_origin * CHUNKW);
 
 		auto light_vp_matrix = m4::scale(1.f/v3f{shadow_world_size, shadow_world_size, CHUNKW*DRAWD}) * m4::rotation_r_yxz(-light_angles) * m4::translation(-lightpos);
 
@@ -2947,14 +3360,29 @@ ENUMERATE_COMPONENTS
 			immediate_context->RSSetViewports(1, &viewport);
 		}
 		immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		immediate_context->VSSetShader(shadow_vs, 0, 0);
-		immediate_context->PSSetShader(shadow_ps, 0, 0);
+		immediate_context->VSSetShader(shaders.shadow_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.shadow_ps, 0, 0);
 		immediate_context->RSSetState(shadow_rasterizer);
 		ID3D11ShaderResourceView *null = 0;
 		immediate_context->PSSetShaderResources(SHADOW_TEXTURE_SLOT, 1, &null);
 		immediate_context->OMSetRenderTargets(0, 0, shadow_dsv);
 		immediate_context->OMSetBlendState(0, {}, -1);
 		immediate_context->ClearDepthStencilView(shadow_dsv, D3D11_CLEAR_DEPTH, 1, 0);
+
+		//{
+		//	timed_block(profiler, profile_frame, "far lands shadow");
+		//
+		//	if (farlands_vb.vertex_count) {
+		//		entity_cbuffer.update({
+		//			.relative_position = {},
+		//			.vertex_offset = 0,
+		//		});
+		//
+		//		immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &farlands_vb.view);
+		//		draw_vertices(farlands_vb.vertex_count);
+		//	}
+		//	//immediate_context->ClearDepthStencilView(shadow_dsv, D3D11_CLEAR_DEPTH, 1, 0);
+		//}
 
 		{
 			timed_block(profiler, profile_frame, "sdf & blocks shadow");
@@ -2982,35 +3410,26 @@ ENUMERATE_COMPONENTS
 						auto chunk_position = get_chunk_position(mask_index * bits_in_chunk_mask + bit_index);
 						auto chunk = get_chunk(chunk_position);
 #endif
-				auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-				if (contains_sphere(light_frustum, relative_position+V3f(CHUNKW/2), sqrt3*CHUNKW)) {
+				if (chunk_in_view(light_frustum, chunk_position)) {
 					visible_chunks.add(chunk);
 
-					auto lod_index = debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod;
+					f32 lod_t = get_chunk_lod_t(chunk_position);
+					auto lod_index = debug_selected_lod == -1 ? (u32)lod_t : debug_selected_lod;
 
 					if (chunk->sdf_vb_vertex_count[lod_index]) {
-						chunk_cbuffer.update({
+						auto relative_position = (v3f)(chunk_position - current_world_origin) * CHUNKW;
+						entity_cbuffer.update({
 							.relative_position = relative_position,
-							.actual_position = (v3f)(chunk_position*CHUNKW),
 							.vertex_offset = chunk->sdf_vb_vertex_offset[lod_index],
+							.lod_t = lod_t - lod_index,
 						});
 
 						immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &chunk->sdf_vb);
-#if USE_INDICES
-						immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-						immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
-#else
-						immediate_context->Draw(chunk->sdf_vb_vertex_count[lod_index], 0);
-#endif
+						draw_vertices(chunk->sdf_vb_vertex_count[lod_index]);
 
 						if (chunk->blocks_vb.view) {
 							immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &chunk->blocks_vb.view);
-#if USE_INDICES
-							immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-							immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
-#else
-							immediate_context->Draw(chunk->blocks_vb.vertex_count, 0);
-#endif
+							draw_vertices(chunk->blocks_vb.vertex_count);
 						}
 					}
 				}
@@ -3022,32 +3441,91 @@ ENUMERATE_COMPONENTS
 		if (draw_trees) {
 			timed_block(profiler, profile_frame, "tree shadow");
 			immediate_context->RSSetState(no_cull_shadow_rasterizer);
-			immediate_context->VSSetShader(tree_shadow_vs, 0, 0);
-			immediate_context->PSSetShader(tree_shadow_ps, 0, 0);
+			immediate_context->VSSetShader(shaders.tree_shadow_vs, 0, 0);
+			immediate_context->PSSetShader(shaders.tree_shadow_ps, 0, 0);
+
+			immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &tree_model.vertex_buffer);
+			immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &tree_model.albedo);
+			immediate_context->IASetIndexBuffer(tree_model.index_buffer, DXGI_FORMAT_R32_UINT, 0);
+			immediate_context->RSSetState(tree_model.no_cull ? no_cull_shadow_rasterizer : shadow_rasterizer);
 
 			for (auto chunk : visible_chunks) {
 				auto chunk_position = get_chunk_position(chunk);
-				auto lod_index = get_chunk_lod_index(chunk_position);
+				auto lod_index = (u32)get_chunk_lod_t(chunk_position);
 
 				if (chunk->trees_instances_buffer.count) {
-					auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-					chunk_cbuffer.update({
+					auto relative_position = (v3f)(chunk_position - current_world_origin) * CHUNKW;
+
+					auto &lod = tree_model.get_lod(lod_index);
+					if (!lod.cast_shadow)
+						continue;
+
+					entity_cbuffer.update({
 						.relative_position = relative_position,
-						.actual_position = (v3f)(chunk_position*CHUNKW),
+						.vertex_offset = lod.start_vertex,
+						.lod_t = chunk->lod_t,
 					});
 
-					auto &model = tree_model.get_lod(lod_index);
-
-					immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &model.vb);
 					immediate_context->VSSetShaderResources(INSTANCE_BUFFER_SLOT, 1, &chunk->trees_instances_buffer.srv);
-					immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &model.albedo);
-					immediate_context->IASetIndexBuffer(model.ib, DXGI_FORMAT_R32_UINT, 0);
-					immediate_context->RSSetState(model.no_cull ? no_cull_shadow_rasterizer : shadow_rasterizer);
-					immediate_context->DrawIndexedInstanced(model.index_count, chunk->trees_instances_buffer.count, 0, 0, 0);
+
+					immediate_context->DrawIndexedInstanced(lod.index_count, chunk->trees_instances_buffer.count, lod.start_index, lod.start_vertex, 0);
+					draw_call_count++;
+
+					//if (chunk->lod_t < 1) {
+					//	entity_cbuffer.update({
+					//		.relative_position = relative_position,
+					//		.actual_position = (v3f)(chunk_position*CHUNKW),
+					//		.lod_t = -chunk->lod_t,
+					//	});
+					//
+					//	auto &model = tree_model.get_lod(chunk->previous_lod);
+					//	immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &model.vb);
+					//	immediate_context->VSSetShaderResources(INSTANCE_BUFFER_SLOT, 1, &chunk->trees_instances_buffer.srv);
+					//	immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &model.albedo);
+					//	immediate_context->RSSetState(model.no_cull ? no_cull_rasterizer : 0);
+					//	immediate_context->IASetIndexBuffer(model.ib, DXGI_FORMAT_R32_UINT, 0);
+					//	immediate_context->DrawIndexedInstanced(model.index_count, chunk->trees_instances_buffer.count, 0, 0, 0);
+					//}
 				}
 			}
 		}
+		//
+		// ENTITIES SHADOW
+		//
+		{
+			scoped_gpu_timer("entities shadow");
 
+			scoped_allocator(temporary_allocator);
+			HashMap<LodModel *, List<Entity *>> entities_to_draw;
+
+			for (auto &mesh : components<MeshComponent>) {
+				entities_to_draw.get_or_insert(mesh.model).add(mesh.entity);
+			}
+
+			immediate_context->VSSetShader(shaders.model_shadow_vs, 0, 0);
+			immediate_context->PSSetShader(shaders.model_shadow_ps, 0, 0);
+			immediate_context->PSSetSamplers(DEFAULT_SAMPLER_SLOT, 1, &default_sampler_wrap);
+			// immediate_context->OMSetBlendState(alpha_to_coverage_blend, {}, -1);
+
+			for_each(entities_to_draw, [&](LodModel *model, List<Entity *> entities){
+				immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT,  1, &model->vertex_buffer);
+				immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, model->albedo ? &model->albedo : &default_albedo);
+				immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, model->normal ? &model->normal : &default_normal);
+				immediate_context->PSSetShaderResources(AO_TEXTURE_SLOT,     1, model->ao     ? &model->ao     : &default_ao    );
+				immediate_context->RSSetState(model->no_cull ? no_cull_shadow_rasterizer : shadow_rasterizer);
+				immediate_context->IASetIndexBuffer(model->index_buffer, DXGI_FORMAT_R32_UINT, 0);
+
+				for (auto entity : entities) {
+					entity_cbuffer.update({
+						.model = to_m4(transpose(std::bit_cast<m3>(entity->rotation.getMatrix()))),
+						.relative_position = entity->position.local + (v3f)(entity->position.chunk - current_world_origin)*CHUNKW,
+						.vertex_offset = model->lods[0].start_vertex,
+					});
+
+					draw_indexed(model->lods[0].index_count, model->lods[0].start_index, model->lods[0].start_vertex);
+				}
+			});
+		}
 
 
 		immediate_context->OMSetRenderTargets(0, 0, 0);
@@ -3058,10 +3536,11 @@ ENUMERATE_COMPONENTS
 			.mvp = camera_matrix,
 			.rotproj = rotproj,
 			.light_vp_matrix = light_vp_matrix,
-			.campos = camera->position.local,
+			.campos = camera_position_relative_to_origin,
 			.time = (f32)get_time(the_timer),
 			.ldir = light_dir,
 			.frame = (f32)frame_number,
+			.draw_mode = draw_mode,
 		});
 	}
 
@@ -3081,16 +3560,16 @@ ENUMERATE_COMPONENTS
 	// SKY RENDER
 	//
 	{
-		timed_block(profiler, profile_frame, "sky render");
+		scoped_gpu_timer("sky render");
 
-		immediate_context->VSSetShader(sky_vs, 0, 0);
-		immediate_context->PSSetShader(sky_ps, 0, 0);
+		immediate_context->VSSetShader(shaders.sky_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.sky_ps, 0, 0);
 		ID3D11ShaderResourceView *null = 0;
 		immediate_context->PSSetShaderResources(SKY_TEXTURE_SLOT, 1, &null);
 		immediate_context->RSSetState(0);
 		immediate_context->OMSetRenderTargets(1, &sky_rt, 0);
 		immediate_context->OMSetBlendState(0, {}, -1);
-		immediate_context->Draw(36, 0);
+		draw_vertices(36);
 
 		immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
 		immediate_context->ClearDepthStencilView(depth_stencil, D3D11_CLEAR_DEPTH, 1, 0);
@@ -3102,49 +3581,53 @@ ENUMERATE_COMPONENTS
 	// SKY BLIT
 	//
 	{
-		timed_block(profiler, profile_frame, "sky blit");
-		immediate_context->VSSetShader(blit_vs, 0, 0);
-		immediate_context->PSSetShader(blit_ps, 0, 0);
+		scoped_gpu_timer("sky blit");
+		immediate_context->VSSetShader(shaders.blit_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.blit_ps, 0, 0);
 		immediate_context->RSSetState(0);
 		immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
 		immediate_context->OMSetBlendState(0, {}, -1);
-		immediate_context->Draw(6, 0);
+		draw_vertices(6);
 	}
 
 	//
-	// CHUNKS SDF MESH
+	// FARLANDS
 	//
 
 	{
-		timed_block(profiler, profile_frame, "draw far lands");
+		scoped_gpu_timer("draw far lands");
 		immediate_context->OMSetRenderTargets(1, &back_buffer, depth_stencil);
 		immediate_context->OMSetBlendState(0, {}, -1);
-		immediate_context->VSSetShader(chunk_sdf_vs, 0, 0);
-		immediate_context->PSSetShader(chunk_sdf_solid_ps, 0, 0);
+		immediate_context->VSSetShader(shaders.chunk_sdf_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.chunk_sdf_solid_ps, 0, 0);
 
 		immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &ground_albedo);
 		immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, &ground_normal);
 		immediate_context->RSSetState(0);
 
 		if (farlands_vb.vertex_count) {
-			chunk_cbuffer.update({
-				.relative_position = {},
+			entity_cbuffer.update({
+				.random = random_v4f({}),
 				.vertex_offset = 0,
 			});
 
 			immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &farlands_vb.view);
-			immediate_context->Draw(farlands_vb.vertex_count, 0);
+			draw_vertices(farlands_vb.vertex_count);
 		}
 		immediate_context->ClearDepthStencilView(depth_stencil, D3D11_CLEAR_DEPTH, 1, 0);
 	}
 
+	//
+	// CHUNKS SDF MESH
+	//
+
 	visible_chunks.clear();
 	{
-		timed_block(profiler, profile_frame, "draw chunks sdf mesh");
+		scoped_gpu_timer("draw chunks sdf mesh");
 		immediate_context->OMSetRenderTargets(1, &back_buffer, depth_stencil);
 		immediate_context->OMSetBlendState(0, {}, -1);
-		immediate_context->VSSetShader(chunk_sdf_vs, 0, 0);
-		immediate_context->PSSetShader(chunk_sdf_solid_ps, 0, 0);
+		immediate_context->VSSetShader(shaders.chunk_sdf_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.chunk_sdf_solid_ps, 0, 0);
 
 		immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &ground_albedo);
 		immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, &ground_normal);
@@ -3174,37 +3657,40 @@ ENUMERATE_COMPONENTS
 #endif
 			chunk->frames_since_remesh += 1;
 
-			auto lod_index = debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod;
+			auto surface_lod_t = get_chunk_lod_t(chunk_position);
+			auto lod_index = debug_selected_lod == -1 ? (u32)surface_lod_t : debug_selected_lod;
 
 			if (chunk->lod_previous_frame != lod_index) {
+				if (lod_index == chunk->previous_lod) {
+					// NOTE: If we are transitioning from lod0 to lod1 and go back to lod0, make it smooth.
+					// One thing that is not perfect is that lod mask flips noticeably.
+					chunk->lod_t = max(0, 1 - chunk->lod_t);
+				} else {
+					chunk->lod_t = 0;
+				}
 				chunk->previous_lod = chunk->lod_previous_frame;
 				chunk->lod_previous_frame = lod_index;
-				chunk->lod_t = 0;
 			}
 
 			// NOTE: If lod_t is zero, the shader doesn't not which way to blend.
 			// So add frame time after setting it to 0.
 			chunk->lod_t += frame_time;
 
-			if (chunk_in_view(chunk_position)) {
+			if (chunk_in_view(camera_frustum, chunk_position)) {
 				visible_chunks.add(chunk);
 
 				if (chunk->sdf_vb_vertex_count[lod_index]) {
-					auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-					chunk_cbuffer.update({
+					auto relative_position = (v3f)(chunk_position - current_world_origin) * CHUNKW;
+					entity_cbuffer.update({
+						.random = random_v4f(chunk_position),
 						.relative_position = relative_position,
 						.was_remeshed = (f32)(chunk->frames_since_remesh < 5),
-						.actual_position = (v3f)(chunk_position*CHUNKW),
 						.vertex_offset = chunk->sdf_vb_vertex_offset[lod_index],
+						.lod_t = surface_lod_t - lod_index,
 					});
 
 					immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &chunk->sdf_vb);
-#if USE_INDICES
-					immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-					immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
-#else
-					immediate_context->Draw(chunk->sdf_vb_vertex_count[lod_index], 0);
-#endif
+					draw_vertices(chunk->sdf_vb_vertex_count[lod_index]);
 				}
 			}
 		}}}
@@ -3214,11 +3700,11 @@ ENUMERATE_COMPONENTS
 	// CHUNKS BLOCKS MESH
 	//
 	{
-		timed_block(profiler, profile_frame, "draw chunks blocks mesh");
+		scoped_gpu_timer("draw chunks blocks mesh");
 		immediate_context->OMSetRenderTargets(1, &back_buffer, depth_stencil);
 		immediate_context->OMSetBlendState(0, {}, -1);
-		immediate_context->VSSetShader(chunk_block_vs, 0, 0);
-		immediate_context->PSSetShader(chunk_block_ps, 0, 0);
+		immediate_context->VSSetShader(shaders.chunk_block_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.chunk_block_ps, 0, 0);
 
 		immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &planks_albedo);
 		immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, &planks_normal);
@@ -3229,19 +3715,14 @@ ENUMERATE_COMPONENTS
 
 			auto &vertex_buffer = chunk->blocks_vb;
 			if (vertex_buffer.view) {
-				auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-				chunk_cbuffer.update({
+				auto relative_position = (v3f)(chunk_position - current_world_origin) * CHUNKW;
+				entity_cbuffer.update({
+					.random = random_v4f(chunk_position),
 					.relative_position = relative_position,
-					.actual_position = (v3f)(chunk_position*CHUNKW),
 				});
 
 				immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &vertex_buffer.view);
-#if USE_INDICES
-				immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-				immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
-#else
-				immediate_context->Draw(vertex_buffer.vertex_count, 0);
-#endif
+				draw_vertices(vertex_buffer.vertex_count);
 			}
 		}
 	}
@@ -3250,10 +3731,10 @@ ENUMERATE_COMPONENTS
 	// CHUNKS GRASS
 	//
 	if (draw_grass) {
-		timed_block(profiler, profile_frame, "draw chunks grass");
+		scoped_gpu_timer("draw chunks grass");
 		immediate_context->RSSetState(no_cull_rasterizer);
-		immediate_context->VSSetShader(grass_vs, 0, 0);
-		immediate_context->PSSetShader(grass_ps, 0, 0);
+		immediate_context->VSSetShader(shaders.grass_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.grass_ps, 0, 0);
 
 		immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &grass_albedo);
 		immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, &grass_normal);
@@ -3261,22 +3742,17 @@ ENUMERATE_COMPONENTS
 
 		for (auto &chunk : visible_chunks) {
 			auto chunk_position = get_chunk_position(chunk);
-			auto lod_index = get_chunk_lod_index(chunk_position);
+			auto lod_index = (u32)get_chunk_lod_t(chunk_position);
 			if (lod_index <= 1) {
 				if (chunk->grass_vb.view) {
-					auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-					chunk_cbuffer.update({
+					auto relative_position = (v3f)(chunk_position - current_world_origin) * CHUNKW;
+					entity_cbuffer.update({
+						.random = random_v4f(chunk_position + 0x12345678),
 						.relative_position = relative_position,
-						.actual_position = (v3f)(chunk_position*CHUNKW),
 					});
 
 					immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &chunk->grass_vb.view);
-#if USE_INDICES
-					immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-					immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
-#else
-					immediate_context->Draw(chunk->grass_vb.vertex_count, 0);
-#endif
+					draw_vertices(chunk->grass_vb.vertex_count);
 				}
 			}
 		}
@@ -3284,50 +3760,51 @@ ENUMERATE_COMPONENTS
 
 	// TREE
 	if (draw_trees) {
-		timed_block(profiler, profile_frame, "trees surface");
-		immediate_context->VSSetShader(tree_vs, 0, 0);
-		immediate_context->PSSetShader(tree_ps, 0, 0);
-		immediate_context->PSSetSamplers(DEFAULT_SAMPLER_SLOT, 1, &default_sampler_clamp);
+		scoped_gpu_timer("trees surface");
+		immediate_context->VSSetShader(shaders.tree_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.tree_ps, 0, 0);
+		immediate_context->PSSetSamplers(DEFAULT_SAMPLER_SLOT, 1, &default_sampler_wrap);
 		// immediate_context->OMSetBlendState(alpha_to_coverage_blend, {}, -1);
+
+		immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &tree_model.vertex_buffer);
+		immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &tree_model.albedo);
+		immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, &tree_model.normal);
+		immediate_context->PSSetShaderResources(AO_TEXTURE_SLOT,     1, &tree_model.ao);
+		immediate_context->RSSetState(tree_model.no_cull ? no_cull_rasterizer : 0);
+		immediate_context->IASetIndexBuffer(tree_model.index_buffer, DXGI_FORMAT_R32_UINT, 0);
 
 		for (auto &chunk : visible_chunks) {
 			auto chunk_position = get_chunk_position(chunk);
-			auto lod_index = get_chunk_lod_index(chunk_position);
+			auto lod_index = (u32)get_chunk_lod_t(chunk_position);
 
 			if (chunk->trees_instances_buffer.count) {
-				auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-				chunk_cbuffer.update({
+				auto relative_position = (v3f)(chunk_position - current_world_origin) * CHUNKW;
+
+				auto &lod = tree_model.get_lod(lod_index);
+
+				entity_cbuffer.update({
+					.random = random_v4f(chunk_position + 0x87654321),
 					.relative_position = relative_position,
-					.actual_position = (v3f)(chunk_position*CHUNKW),
+					.vertex_offset = lod.start_vertex,
 					.lod_t = chunk->lod_t,
 				});
 
-				auto &model = tree_model.get_lod(lod_index);
-				immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &model.vb);
 				immediate_context->VSSetShaderResources(INSTANCE_BUFFER_SLOT, 1, &chunk->trees_instances_buffer.srv);
-				immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &model.albedo);
-				immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, &model.normal);
-				immediate_context->PSSetShaderResources(AO_TEXTURE_SLOT,     1, &model.ao);
-				immediate_context->RSSetState(model.no_cull ? no_cull_rasterizer : 0);
-				immediate_context->IASetIndexBuffer(model.ib, DXGI_FORMAT_R32_UINT, 0);
-				immediate_context->DrawIndexedInstanced(model.index_count, chunk->trees_instances_buffer.count, 0, 0, 0);
+				immediate_context->DrawIndexedInstanced(lod.index_count, chunk->trees_instances_buffer.count, lod.start_index, lod.start_vertex, 0);
+				draw_call_count++;
 
 				if (chunk->lod_t < 1) {
-					chunk_cbuffer.update({
+					auto &lod = tree_model.get_lod(chunk->previous_lod);
+
+					entity_cbuffer.update({
+						.random = random_v4f(chunk_position + 0x87654321),
 						.relative_position = relative_position,
-						.actual_position = (v3f)(chunk_position*CHUNKW),
+						.vertex_offset = lod.start_vertex,
 						.lod_t = -chunk->lod_t,
 					});
 
-					auto &model = tree_model.get_lod(chunk->previous_lod);
-					immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &model.vb);
-					immediate_context->VSSetShaderResources(INSTANCE_BUFFER_SLOT, 1, &chunk->trees_instances_buffer.srv);
-					immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, &model.albedo);
-					immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, &model.normal);
-					immediate_context->PSSetShaderResources(AO_TEXTURE_SLOT,     1, &model.ao);
-					immediate_context->RSSetState(model.no_cull ? no_cull_rasterizer : 0);
-					immediate_context->IASetIndexBuffer(model.ib, DXGI_FORMAT_R32_UINT, 0);
-					immediate_context->DrawIndexedInstanced(model.index_count, chunk->trees_instances_buffer.count, 0, 0, 0);
+					immediate_context->DrawIndexedInstanced(lod.index_count, chunk->trees_instances_buffer.count, lod.start_index, lod.start_vertex, 0);
+					draw_call_count++;
 				}
 			}
 		}
@@ -3339,70 +3816,284 @@ ENUMERATE_COMPONENTS
 	if (key_down('R'))
 		wireframe_rasterizer_enabled = !wireframe_rasterizer_enabled;
 
+	immediate_context->RSSetState(wireframe_rasterizer);
+	immediate_context->VSSetShader(shaders.chunk_sdf_vs, 0, 0);
+	immediate_context->PSSetShader(shaders.chunk_sdf_wire_ps, 0, 0);
+	immediate_context->OMSetBlendState(0, {}, -1);
+
 	if (wireframe_rasterizer_enabled) {
-		immediate_context->RSSetState(wireframe_rasterizer);
-		immediate_context->VSSetShader(chunk_sdf_vs, 0, 0);
-		immediate_context->PSSetShader(chunk_sdf_wire_ps, 0, 0);
-		immediate_context->OMSetBlendState(alpha_blend, {}, -1);
 		for (auto &chunk : visible_chunks) {
 			auto chunk_position = get_chunk_position(chunk);
-			auto lod_index = debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod;
+
+			f32 lod_t = get_chunk_lod_t(chunk_position);
+			auto lod_index = debug_selected_lod == -1 ? (u32)lod_t : debug_selected_lod;
+
 			if (chunk->sdf_vb_vertex_count[lod_index]) {
-				auto relative_position = (v3f)((chunk_position-camera->position.chunk)*CHUNKW);
-				chunk_cbuffer.update({
+				auto relative_position = (v3f)(chunk_position - current_world_origin) * CHUNKW;
+				entity_cbuffer.update({
 					.relative_position = relative_position,
-					.actual_position = (v3f)(chunk_position*CHUNKW),
 					.vertex_offset = chunk->sdf_vb_vertex_offset[lod_index],
+					.lod_t = lod_t - lod_index,
 				});
 
 				immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &chunk->sdf_vb);
-#if USE_INDICES
-				immediate_context->IASetIndexBuffer(chunk->index_buffer, DXGI_FORMAT_R32_UINT, 0);
-				immediate_context->DrawIndexed(chunk->indices_count, 0, 0);
-#else
-				immediate_context->Draw(chunk->sdf_vb_vertex_count[lod_index], 0);
-#endif
+				draw_vertices(chunk->sdf_vb_vertex_count[lod_index]);
 			}
 		}
 	}
 
-	immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	immediate_context->VSSetShader(cursor_vs, 0, 0);
-	immediate_context->PSSetShader(cursor_ps, 0, 0);
+	//
+	// ENTITIES
+	//
+	{
+		scoped_gpu_timer("entities");
 
-	auto draw_cursor = [&](ChunkRelativePosition position) {
-		chunk_cbuffer.update({
-			.relative_position = position.local + (v3f)((position.chunk-camera->position.chunk)*CHUNKW),
+		scoped_allocator(temporary_allocator);
+		HashMap<LodModel *, List<Entity *>> entities_to_draw;
+
+		for (auto &mesh : components<MeshComponent>) {
+			entities_to_draw.get_or_insert(mesh.model).add(mesh.entity);
+		}
+
+		immediate_context->VSSetShader(shaders.model_vs, 0, 0);
+		immediate_context->PSSetShader(shaders.model_ps, 0, 0);
+		immediate_context->PSSetSamplers(DEFAULT_SAMPLER_SLOT, 1, &default_sampler_wrap);
+		// immediate_context->OMSetBlendState(alpha_to_coverage_blend, {}, -1);
+
+		for_each(entities_to_draw, [&](LodModel *model, List<Entity *> entities){
+			immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT,  1, &model->vertex_buffer);
+			immediate_context->PSSetShaderResources(ALBEDO_TEXTURE_SLOT, 1, model->albedo ? &model->albedo : &default_albedo);
+			immediate_context->PSSetShaderResources(NORMAL_TEXTURE_SLOT, 1, model->normal ? &model->normal : &default_normal);
+			immediate_context->PSSetShaderResources(AO_TEXTURE_SLOT,     1, model->ao     ? &model->ao     : &default_ao    );
+			immediate_context->RSSetState(model->no_cull ? no_cull_rasterizer : 0);
+			immediate_context->IASetIndexBuffer(model->index_buffer, DXGI_FORMAT_R32_UINT, 0);
+
+			for (auto entity : entities) {
+				entity_cbuffer.update({
+					.model = to_m4(transpose(std::bit_cast<m3>(entity->rotation.getMatrix()))),
+					.relative_position = entity->position.local + (v3f)(entity->position.chunk-current_world_origin)*CHUNKW,
+					.vertex_offset = model->lods[0].start_vertex,
+				});
+
+				draw_indexed(model->lods[0].index_count, model->lods[0].start_index, model->lods[0].start_vertex);
+			}
 		});
-		immediate_context->Draw(36, 0);
-	};
-
-	draw_cursor(opponent_position);
-
-	for (auto &grenade : components<GrenadeComponent>) {
-		draw_cursor(grenade.entity.position);
 	}
 
-	for (auto &ps : components<ParticleSystemComponent>) {
-		for (auto &particle : ps.particles)
-			draw_cursor({ps.particles_chunk_position, particle.position});
+	//
+	// DRAW DEBUG PHYSICS
+	//
+	{
+		auto &debug = physics_world->getDebugRenderer();
+
+		auto &triangles = debug.getTriangles();
+		if (triangles.size()) {
+			struct Vertex {
+				v3f position;
+				u32 color;
+			};
+
+			auto vertices = Span((Vertex *)&triangles[0], triangles.size()*3);
+
+			static ID3D11ShaderResourceView *debug_buffer = 0;
+			if (debug_buffer) {
+				debug_buffer->Release();
+				debug_buffer = 0;
+			}
+			sizeof(triangles[0]);
+			debug_buffer = create_structured_buffer(vertices);
+
+			immediate_context->RSSetState(wireframe_rasterizer);
+			immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			immediate_context->VSSetShader(shaders.collider_vs, 0, 0);
+			immediate_context->PSSetShader(shaders.collider_ps, 0, 0);
+			immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &debug_buffer);
+			draw_vertices(vertices.count);
+		}
+
+		auto &lines = debug.getLines();
+		if (lines.size()) {
+			static ID3D11ShaderResourceView *debug_buffer = 0;
+			if (debug_buffer) {
+				debug_buffer->Release();
+				debug_buffer = 0;
+			}
+			debug_buffer = create_structured_buffer(Span(&lines[0], lines.size()));
+
+			immediate_context->RSSetState(wireframe_rasterizer);
+			immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
+			immediate_context->VSSetShader(shaders.collider_vs, 0, 0);
+			immediate_context->PSSetShader(shaders.collider_ps, 0, 0);
+			immediate_context->VSSetShaderResources(VERTEX_BUFFER_SLOT, 1, &debug_buffer);
+			draw_vertices(lines.size()*2);
+		}
 	}
+
 
 	immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
 	immediate_context->RSSetState(0);
 	immediate_context->OMSetRenderTargets(1, &back_buffer, 0);
 	immediate_context->OMSetBlendState(0, {}, -1);
-	immediate_context->VSSetShader(crosshair_vs, 0, 0);
-	immediate_context->PSSetShader(crosshair_ps, 0, 0);
-	immediate_context->Draw(4, 0);
+	immediate_context->VSSetShader(shaders.crosshair_vs, 0, 0);
+	immediate_context->PSSetShader(shaders.crosshair_ps, 0, 0);
+	draw_vertices(4);
 
 
 	{
 		timed_block(profiler, profile_frame, "ui");
+
+		u32 const font_size = 16;
+
+		struct Label {
+			v2f position;
+			v2f size;
+			Span<utf8> text;
+		};
+		StaticList<Label, 1024*16> labels;
+
+		//
+		// PROFILE
+		//
+		if (show_profile) {
+			immediate_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+			immediate_context->OMSetBlendState(alpha_blend, v4f{}.s, -1);
+			immediate_context->VSSetShader(shaders.color_vs, 0, 0);
+			immediate_context->PSSetShader(shaders.color_ps, 0, 0);
+			auto rect = [&](v2f position, v2f size, v4f color) {
+				D3D11_VIEWPORT viewport {
+					.TopLeftX = clamp<f32>(position.x, 0, window_client_size.x),
+					.TopLeftY = position.y,
+					.Width = clamp<f32>(size.x, 0, window_client_size.x - position.x),
+					.Height = size.y,
+					.MinDepth = 0,
+					.MaxDepth = 1,
+				};
+				immediate_context->RSSetViewports(1, &viewport);
+				entity_cbuffer.update({
+					.random = color,
+				});
+				draw_vertices(6);
+			};
+
+			auto get_groups_from_sorted = [&]<class T, umm capacity, class Fn>(StaticList<Span<T>, capacity> *destination, Span<T> source, Fn &&property) {
+				if (!source.count)
+					return;
+
+				umm first_index = 0;
+				umm current_index = 0;
+
+				auto current_property = property(source.data[0]);
+
+				++current_index;
+
+				while (current_index < source.count) {
+					auto new_property = property(source.data[current_index]);
+					if (new_property != current_property) {
+						destination->add({source.data + first_index, source.data + current_index});
+
+						current_property = new_property;
+						first_index = current_index;
+					}
+
+					++current_index;
+				}
+				destination->add({source.data + first_index, source.data + current_index});
+			};
+
+			StaticList<Span<Profiler::TimeSpan>, 8> thread_spans;
+			get_groups_from_sorted(&thread_spans, previous_frame_profile, [&](Profiler::TimeSpan a) { return a.thread_id; });
+
+			f32 const thread_stride = font_size*8;
+			u32 thread_index = 0;
+			for (auto &thread_span : thread_spans) {
+				defer { ++thread_index; };
+
+				StaticList<u64, 256> end_stack;
+				u32 deepness = 0;
+
+				for (auto span : thread_span) {
+					defer { end_stack.add(span.end); };
+					if (end_stack.count) {
+						while (end_stack.count && span.end >= end_stack.back()) {
+							end_stack.pop_back();
+							--deepness;
+						}
+						++deepness;
+					}
+
+					f64 const x_scale = 0.5 * (f64)window_client_size.x / performance_frequency / target_frame_time;
+					f32 x = span.begin * x_scale;
+					if (x >= window_client_size.x)
+						continue;
+
+					f32 w = max(1, (f32)(span.end - span.begin) * x_scale);
+					f32 h = font_size;
+					f32 y = 350.f+thread_index*thread_stride + deepness*h;
+
+					labels.add({{x,y}, {w,h}, span.name});
+					rect(
+						{x,y},
+						{w,h},
+						V4f(random_v3f(get_hash(span.name)), .5f)
+					);
+				}
+			}
+			struct NamedGpuTime {
+				GpuTime time;
+				char const *name;
+			};
+			StaticList<NamedGpuTime, 256> gpu_times;
+
+			u64 start_tick = -1;
+			for (auto query : gpu_time_queries) {
+				auto time = get_gpu_time(query);
+				start_tick = min(start_tick, time.start);
+				gpu_times.add({time, query.name});
+			}
+
+			for (auto _time : gpu_times) {
+				auto time = _time.time;
+				auto name = _time.name;
+				f64 const x_scale = 0.5 * (f64)window_client_size.x / time.frequency / target_frame_time;
+
+				f32 x = (time.start - start_tick) * x_scale;
+				if (x >= window_client_size.x)
+					continue;
+
+				f32 w = max(1, (f32)(time.end - time.start) * x_scale);
+				f32 h = font_size;
+				f32 y = 350.f+thread_index*thread_stride;
+
+
+				auto _name = as_utf8(as_span(name));
+				labels.add({{x,y}, {w,h}, _name});
+				rect(
+					{x,y},
+					{w,h},
+					V4f(random_v3f(get_hash(_name)), .5f)
+				);
+			}
+		}
+
+
+		//
+		// DEBUG TEXT
+		//
+
+		D3D11_VIEWPORT viewport {
+			.TopLeftX = 0,
+			.TopLeftY = 0,
+			.Width = (f32)window_client_size.x,
+			.Height = (f32)window_client_size.y,
+			.MinDepth = 0,
+			.MaxDepth = 1,
+		};
+		immediate_context->RSSetViewports(1, &viewport);
+
 		StringBuilder builder;
 		builder.allocator = temporary_allocator;
 
-		append_format(builder, u8R"(fps: {}
+		append_format(builder, u8R"(frame time: {} ms
 brush_size: {}
 chunk_generation_amount_factor: {}
 camera->position: {}
@@ -3415,9 +4106,10 @@ generate_time: {} ms
 sdfs_generated_per_frame: {}
 n_sdfs_can_generate_this_frame: {}
 remesh_count: {}
+draw_call_count: {}
 profile:
 )"s,
-smooth_fps,
+frame_time * 1000,
 brush_size,
 chunk_generation_amount_factor,
 camera->position,
@@ -3429,17 +4121,18 @@ smoothed_average_generation_time * 1000,
 generate_time * 1000,
 sdfs_generated_per_frame,
 n_sdfs_can_generate_this_frame,
-remesh_count
+remesh_count,
+draw_call_count
 );
-		HashMap<Span<utf8>, u64> time_spans;
-		time_spans.allocator = temporary_allocator;
-
-		for (auto &span : profiler.recorded_time_spans) {
-			time_spans.get_or_insert(span.name) += span.end - span.begin;
-		}
-		for_each(time_spans, [&] (auto name, auto duration) {
-			append_format(builder, "  {} {}us\n", name, duration * 1'000'000 / performance_frequency);
-		});
+		// HashMap<Span<utf8>, u64> time_spans;
+		// time_spans.allocator = temporary_allocator;
+		//
+		// for (auto &span : profiler.recorded_time_spans) {
+		// 	time_spans.get_or_insert(span.name) += span.end - span.begin;
+		// }
+		// for_each(time_spans, [&] (auto name, auto duration) {
+		// 	append_format(builder, "  {} {}us\n", name, duration * 1'000'000 / performance_frequency);
+		// });
 
 		append_format(builder, "chunk info:\n{}", chunk_info_string);
 		append_format(builder, "allocation info:\n{}", allocation_info_string);
@@ -3447,12 +4140,25 @@ remesh_count
 		auto string = to_string(builder);
 		defer { free(string); };
 
-		draw_text((Span<utf8>)string, 16, {});
+		draw_text((Span<utf8>)string, font_size, {});
+
+		immediate_context->RSSetState(scissor_rasterizer);
+		for (auto label : labels) {
+			D3D11_RECT scissor {
+				.left = (LONG)label.position.x,
+				.top = (LONG)label.position.y,
+				.right = (LONG)(label.position.x + label.size.x),
+				.bottom = (LONG)(label.position.y + label.size.y),
+			};
+			immediate_context->RSSetScissorRects(1, &scissor);
+			draw_text(label.text, font_size, label.position);
+		}
 	}
+	immediate_context->RSSetState(0);
 #if 0
 	for (auto &chunk : flatten(chunks)) {
 		auto chunk_position = get_chunk_position(&chunk);
-		auto &vertex_buffer = chunk.sdf_vertex_buffers[debug_selected_lod == -1 ? get_chunk_lod_index(chunk_position) : debug_selected_lod];
+		auto &vertex_buffer = chunk.sdf_vertex_buffers[debug_selected_lod == -1 ? (u32)get_chunk_lod_t(chunk_position) : debug_selected_lod];
 		if (vertex_buffer.view) {
 			timed_block(profiler, profile_frame, "draw chunk");
 			if (chunk_in_view(chunk_position)) {
@@ -3539,46 +4245,6 @@ void resize() {
 			}
 		}
 	}
-}
-
-ID3D11VertexShader *create_vs(auto source) {
-	ID3DBlob *errors = 0;
-	auto print_errors = [&] {
-		print(Span((char *)errors->GetBufferPointer(), errors->GetBufferSize()));
-	};
-
-	ID3DBlob *code = 0;
-	if (FAILED(D3DCompile(source.data, source.count, "vs_source", 0, 0, "main", "vs_5_0", 0, 0, &code, &errors))) {
-		print_errors();
-		invalid_code_path();
-	} else if (errors) {
-		print_errors();
-		errors->Release();
-		errors = 0;
-	}
-	ID3D11VertexShader *vs;
-	dhr(device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), 0, &vs));
-	return vs;
-}
-
-ID3D11PixelShader *create_ps(auto source) {
-	ID3DBlob *errors = 0;
-	auto print_errors = [&] {
-		print(Span((char *)errors->GetBufferPointer(), errors->GetBufferSize()));
-	};
-
-	ID3DBlob *code = 0;
-	if (FAILED(D3DCompile(source.data, source.count, "ps_source", 0, 0, "main", "ps_5_0", 0, 0, &code, &errors))) {
-		print_errors();
-		invalid_code_path();
-	} else if (errors) {
-		print_errors();
-		errors->Release();
-		errors = 0;
-	}
-	ID3D11PixelShader *ps;
-	dhr(device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), 0, &ps));
-	return ps;
 }
 
 LRESULT WINAPI wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -3730,8 +4396,14 @@ void receive_loop() {
 	}
 }
 
+auto float_error(auto value) {
+	return nextafter(value, value * 2) - value;
+}
 
-int main(int argc, char **argv) {
+s32 tl_main(Span<Span<utf8>> arguments) {
+	printf("%f\n", float_error((f32)CHUNKW) / float_error((f64)CHUNKW*max_value<s32>+CHUNKW));
+	init_printer();
+
 	// {
 	// 	m4 a = *(m4 *)argv[0];
 	// 	m4 b = *(m4 *)argv[1];
@@ -3740,22 +4412,19 @@ int main(int argc, char **argv) {
 	// }
 
 	HINSTANCE hInstance = GetModuleHandleW(0);
-	init_allocator();
 
-	init_tracking_allocator();
-	current_allocator = tracking_allocator;
-	tracking_allocator_fallback = os_allocator;
-
-	void *test = current_allocator.allocate(16);
-	void *test2 = current_allocator.reallocate(test, 16, 32);
-	current_allocator.free(test2);
+	//init_tracking_allocator();
+	//current_allocator = tracking_allocator;
+	//tracking_allocator_fallback = os_allocator;
 
 	executable_path = get_executable_path();
 	executable_directory = parse_path(executable_path).directory;
 
 	_chunks = (decltype(_chunks))VirtualAlloc(0, sizeof(chunks[0][0][0]) * pow3(DRAWD*2+1), MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
 	for (auto &chunk : flatten(chunks)) {
-		construct(chunk.sdf_vertex_positions);
+		construct(chunk.physics_vertices);
+		construct(chunk.physics_indices);
+		construct(chunk.trees);
 		chunk.lod_t = 1;
 #if USE_INDICES
 		construct(chunk.indices);
@@ -3770,6 +4439,8 @@ int main(int argc, char **argv) {
 	construct(entities_to_remove);
 	construct(entities);
 	construct(tree_model);
+	construct(previous_frame_profile);
+	construct(gpu_time_queries);
 #define e(name) construct(components<name>);
 ENUMERATE_COMPONENTS
 #undef e
@@ -3777,8 +4448,6 @@ ENUMERATE_COMPONENTS
 	thread_count = get_cpu_info().logical_processor_count;
 	//thread_count = 1;
 	init_thread_pool(thread_pool, thread_count-1); // main thread is also a worker
-
-	init_printer();
 
 	WSADATA wsaData;
 	if (auto err = WSAStartup(MAKEWORD(2, 2), &wsaData); err != 0) {
@@ -3817,10 +4486,10 @@ ENUMERATE_COMPONENTS
 	assert(test.pop().value() == 8);
 	assert(test.pop().value() == 9);
 #endif
-	if (argc != 1) {
+	if (arguments.count != 1) {
 		opponent_socket = net::create_socket(net::Connection_tcp);
 
-		if (!net::connect(opponent_socket, inet_addr(argv[1]), 27015) != 0) {
+		if (!net::connect(opponent_socket, inet_addr((char *)arguments[1].data), 27015) != 0) {
 			print("connection failed");
 			print_wsa_error();
 			exit(1);
@@ -4042,803 +4711,35 @@ skip_load:
 	};
 
 	auto feature = D3D_FEATURE_LEVEL_12_1;
+#if D3D11_DEBUG
 	dhr(D3D11CreateDeviceAndSwapChain(0, D3D_DRIVER_TYPE_HARDWARE, 0, D3D11_CREATE_DEVICE_DEBUG, &feature, 1, D3D11_SDK_VERSION, &sd, &swap_chain, &device, 0, &immediate_context));
 	dhr(device->QueryInterface(&debug_info_queue));
+#else
+	dhr(D3D11CreateDeviceAndSwapChain(0, D3D_DRIVER_TYPE_HARDWARE, 0, 0, &feature, 1, D3D11_SDK_VERSION, &sd, &swap_chain, &device, 0, &immediate_context));
+#endif
 
 	resize();
-
-	chunk_sdf_vs = create_vs(HLSL_CBUFFER HLSL_COMMON R"(
-struct Vertex {
-	float3 position;
-	uint normal;
-};
-
-StructuredBuffer<Vertex> s_vertex_buffer : VERTEX_BUFFER_SLOT;
-
-void main(
-	in uint vertex_id : SV_VertexID,
-
-	out float3 normal : NORMAL,
-	out float3 color : COLOR,
-	out float3 wpos : WPOS,
-	out float3 view : VIEW,
-	out float4 screen_uv : SCREEN_UV,
-	out float4 shadow_map_uv : SHADOW_MAP_UV,
-	out float4 position : SV_Position
-) {
-	float3 pos = s_vertex_buffer[vertex_id+c_vertex_offset].position + c_relative_position;
-	wpos = pos;
-	normal = decode_normal(s_vertex_buffer[vertex_id+c_vertex_offset].normal);
-	view = pos - c_campos;
-
-	if (c_was_remeshed == 0) {
-#if 0
-		// random color per chunk
-		color = frac(c_actual_position * float3(1.23, 5.67, 8.9));
-		color += color.zxy * float3(1.23, 5.67, 8.9);
-		color += color.zxy * float3(1.23, 5.67, 8.9);
-		color = frac(color+0.1f);
-#else
-		// ground color
-		color = 1;
-#endif
-	} else {
-		color = float3(1, 0, 0);
-		//color = float3(0,0,1);
-	}
-
-	position = mul(c_mvp, float4(pos, 1.0f));
-	screen_uv = position * float4(1, -1, 1, 1);
-
-	shadow_map_uv = mul(light_vp_matrix, float4(pos, 1));
-}
-)"s);
-
-	chunk_sdf_solid_ps = create_ps(HLSL_CBUFFER HLSL_COMMON HLSL_LIGHTING HLSL_TRIPLANAR R"(
-void main(
-	in float3 normal : NORMAL,
-	in float3 color_ : COLOR,
-	in float3 wpos : WPOS,
-	in float3 view : VIEW,
-	in float4 screen_uv : SCREEN_UV,
-	in float4 shadow_map_uv : SHADOW_MAP_UV,
-
-	out float4 pixel_color : SV_Target
-) {
-	normal = normalize(normal);
-
-	float3 L = c_ldir;
-	float3 N = float4(triplanar_normal(normal_texture, default_sampler, wpos/32, normal), 1);
-
-	float3 V = -normalize(view);
-	float3 H = normalize(V + L);
-
-	float NV = max(dot(N, V), 1e-3f);
-	float NL = max(dot(N, L), 1e-3f);
-	float NH = max(dot(N, H), 1e-3f);
-	float VH = max(dot(V, H), 1e-3f);
-
-	float4 trip = triplanar(albedo_texture, default_sampler, wpos/32, normal);
-	//pixel_color = N.xyzz;
-	//return;
-
-	float3 grass = float3(.6,.9,.2)*.8;
-	float3 rock  = float3(.2,.2,.1);
-
-	float gr = smoothstep(0.3, 0.7, normal.y);
-	gr = lerp(gr, trip, (0.5f - abs(0.5f - gr)) * 2);
-
-	float3 albedo = lerp(rock, grass, gr) * trip;// * color_;
-
-	float metalness = 0;
-	float roughness = 1;
-
-	screen_uv = (screen_uv / screen_uv.w) * 0.5 + 0.5;
-	float3 ambient_color = sky_texture.Sample(default_sampler, screen_uv.xy);
-
-	float3 F0 = 0.04;
-	F0 = lerp(F0, albedo, metalness);
-
-	float D = trowbridge_reitz_ggx(NH, roughness);
-	float G = smith_schlick(NV, NL, k_direct(roughness));
-	float3 F = fresnel_schlick(NV, F0);
-	float3 specular = cook_torrance(D, F, G, NV, NL);
-	float3 diffuse = albedo * NL * (1 - metalness) / pi * (1 - specular);
-
-	float3 ambient_specular = ambient_color * F * smith_schlick(NV, 1, k_ibl(roughness));
-	float3 ambient_diffuse = albedo * ambient_color * (1-ambient_specular);
-	float3 ambient = (ambient_diffuse + ambient_specular) / pi;
-
-	shadow_map_uv /= shadow_map_uv.w;
-	shadow_map_uv.y *= -1;
-	float shadow_mask = saturate(map(length(shadow_map_uv.xyz), 0.9, 1, 0, 1));
-	shadow_map_uv = shadow_map_uv * 0.5 + 0.5;
-
-	float lightness = lerp(shadow_texture.SampleCmpLevelZero(shadow_sampler, shadow_map_uv.xy, shadow_map_uv.z).x, 1, shadow_mask);
-	pixel_color.rgb = ambient + (diffuse + specular) * lightness;
-	pixel_color.a = 1;
-
-	float fog = min(1, length(view) / (CHUNKW*FARD));
-	fog *= fog;
-	fog *= fog;
-	pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
-
-	//if (frac(wpos/32).x*32 < 1 ||
-	//	frac(wpos/32).y*32 < 1 ||
-	//	frac(wpos/32).z*32 < 1
-	//)
-	//	pixel_color = float4(1,0,0,1);
-
-	//pixel_color = shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01);
-	//pixel_color = shadowtex.Sample(sam, shadow_map_uv.xy);
-
-}
-)"s);
-
-
-	chunk_sdf_wire_ps = create_ps(R"(
-void main(in float3 normal : NORMAL, in float3 color : COLOR, out float4 pixel_color : SV_Target) {
-	pixel_color.rgb = 0;
-	pixel_color.a = 1;
-}
-)"s);
-
-	cursor_vs = create_vs(HLSL_CBUFFER R"(
-void main(in uint vertex_id : SV_VertexID, out float3 color : COLOR, out float4 position : SV_Position) {
-	float3 positions[] = {
-		// front
-		{-1, 1, 1},
-		{-1,-1, 1},
-		{ 1,-1, 1},
-		{ 1, 1, 1},
-		{-1, 1, 1},
-		{ 1,-1, 1},
-
-		// back
-		{-1,-1,-1},
-		{-1, 1,-1},
-		{ 1,-1,-1},
-		{-1, 1,-1},
-		{ 1, 1,-1},
-		{ 1,-1,-1},
-
-		// right
-		{ 1,-1, 1},
-		{ 1,-1,-1},
-		{ 1, 1,-1},
-		{ 1, 1, 1},
-		{ 1,-1, 1},
-		{ 1, 1,-1},
-
-		// left
-		{-1,-1,-1},
-		{-1,-1, 1},
-		{-1, 1,-1},
-		{-1,-1, 1},
-		{-1, 1, 1},
-		{-1, 1,-1},
-
-		// top
-		{-1, 1,-1},
-		{-1, 1, 1},
-		{ 1, 1,-1},
-		{-1, 1, 1},
-		{ 1, 1, 1},
-		{ 1, 1,-1},
-
-		// bottom
-		{-1,-1, 1},
-		{-1,-1,-1},
-		{ 1,-1,-1},
-		{ 1,-1, 1},
-		{-1,-1, 1},
-		{ 1,-1,-1},
-	};
-
-	position = mul(c_mvp, float4(positions[vertex_id]+c_relative_position, 1.0f));
-	color = positions[vertex_id];
-}
-)"s);
-	cursor_ps = create_ps(R"(
-void main(in float3 color: COLOR, out float4 pixel_color : SV_Target) {
-	pixel_color = float4(color, 1);
-}
-)"s);
-
-	sky_vs = create_vs(HLSL_CBUFFER R"(
-void main(in uint vertex_id : SV_VertexID, out float3 view : VIEW, out float4 position : SV_Position) {
-	float3 positions[] = {
-		// front
-		{-1,-1, 1},
-		{-1, 1, 1},
-		{ 1,-1, 1},
-		{-1, 1, 1},
-		{ 1, 1, 1},
-		{ 1,-1, 1},
-
-		// back
-		{-1, 1,-1},
-		{-1,-1,-1},
-		{ 1,-1,-1},
-		{ 1, 1,-1},
-		{-1, 1,-1},
-		{ 1,-1,-1},
-
-		// right
-		{ 1,-1,-1},
-		{ 1,-1, 1},
-		{ 1, 1,-1},
-		{ 1,-1, 1},
-		{ 1, 1, 1},
-		{ 1, 1,-1},
-
-		// left
-		{-1,-1, 1},
-		{-1,-1,-1},
-		{-1, 1,-1},
-		{-1, 1, 1},
-		{-1,-1, 1},
-		{-1, 1,-1},
-
-		// top
-		{-1, 1, 1},
-		{-1, 1,-1},
-		{ 1, 1,-1},
-		{ 1, 1, 1},
-		{-1, 1, 1},
-		{ 1, 1,-1},
-
-		// bottom
-		{-1,-1,-1},
-		{-1,-1, 1},
-		{ 1,-1,-1},
-		{-1,-1, 1},
-		{ 1,-1, 1},
-		{ 1,-1,-1},
-	};
-	view = positions[vertex_id];
-	position = mul(c_rotproj, float4(positions[vertex_id], 1));
-}
-)"s);
-	sky_ps = create_ps(HLSL_CBUFFER HLSL_COMMON R"(
-void main(in float3 view : VIEW, out float4 pixel_color : SV_Target) {
-	float3 L = c_ldir;
-	float3 V = normalize(view);
-	float3 color = 0;
-	color = lerp(float3(.27,.34,.37), float3(.01,.10,.8), smoothstep(-1, 1, dot(V, float3(0,1,0))));
-	//color = lerp(0, color, smoothstep(-0.5, 0, dot(V, float3(0,1,0))));
-	color += pow(map_clamped(dot(V, L), .5, .99, 0, 1), 100);
-	pixel_color = float4(rgb_to_srgb(color), 1);
-}
-)"s);
-
-	blit_vs = create_vs(R"(
-void main(in uint vertex_id : SV_VertexID, out float2 uv : UV, out float4 position : SV_Position) {
-	float2 positions[] = {
-		{-1,-1},
-		{-1, 1},
-		{ 1,-1},
-		{-1, 1},
-		{ 1, 1},
-		{ 1,-1},
-	};
-	uv = positions[vertex_id]*float2(0.5,-.5)+0.5;
-	position = float4(positions[vertex_id], 0, 1);
-}
-)"s);
-	blit_ps = create_ps(HLSL_CBUFFER R"(
-void main(in float2 uv : UV, out float4 pixel_color : SV_Target) {
-	pixel_color = sky_texture.Sample(default_sampler, uv);
-}
-)"s);
-
-	shadow_vs = create_vs(HLSL_CBUFFER R"(
-struct Vertex {
-	float3 position;
-	uint normal;
-};
-
-StructuredBuffer<Vertex> s_vertex_buffer : VERTEX_BUFFER_SLOT;
-
-void main(
-	in uint vertex_id : SV_VertexID,
-	out float4 screen_uv : SCREEN_UV,
-	out float4 position : SV_Position
-) {
-	float3 pos = s_vertex_buffer[vertex_id+c_vertex_offset].position + c_relative_position;
-	position = mul(c_mvp, float4(pos, 1.0f));
-	screen_uv = position * float4(1, -1, 1, 1);
-}
-)"s);
-
-	shadow_ps = create_ps(HLSL_CBUFFER HLSL_COMMON R"(
-void main(
-	in float4 screen_uv : SCREEN_UV
-) {
-	//float dx = ddx(screen_uv.z);
-	//float dy = ddy(screen_uv.z);
-	//pixel_color = float2(screen_uv.z, dx*dx + dy*dy);//map(screen_uv.z, -1, 1, 0, 1);
-}
-)"s);
-
-	font_vs = create_vs(R"(
-struct Vertex {
-	float2 position;
-	float2 uv;
-};
-
-StructuredBuffer<Vertex> vertices : VERTEX_BUFFER_SLOT;
-
-void main(in uint vertex_id : SV_VertexID, out float2 uv : UV, out float4 position : SV_Position) {
-	Vertex v = vertices[vertex_id];
-	position = float4(v.position, 0, 1);
-	uv = v.uv;
-}
-)"s);
-	font_ps = create_ps(HLSL_CBUFFER R"(
-Texture2D tex : register(t0);
-void main(in float2 uv : UV, out float4 pixel_color0 : SV_Target, out float4 pixel_color1 : SV_Target1) {
-	pixel_color0 = 1;
-	pixel_color1 = float4(tex.Sample(default_sampler, uv).rgb, 1);
-}
-)"s);
-
-	crosshair_vs = create_vs(R"(
-void main(in uint vertex_id : SV_VertexID, out float4 position : SV_Position) {
-	float size = .01;
-	float2 positions[] = {
-		{-size, 0},
-		{ size, 0},
-		{ 0,-size},
-		{ 0, size},
-	};
-
-	position = float4(positions[vertex_id], 0, 1);
-}
-)"s);
-	crosshair_ps = create_ps(R"(
-void main(out float4 pixel_color : SV_Target) {
-	pixel_color = 1;
-}
-)"s);
-
-	grass_vs = create_vs(HLSL_CBUFFER HLSL_COMMON R"(
-struct Vertex {
-	float3 origin;
-	float3 position;
-	float3 normal;
-	float2 uv;
-};
-
-StructuredBuffer<Vertex> s_vertex_buffer : VERTEX_BUFFER_SLOT;
-
-void main(
-	in uint vertex_id : SV_VertexID,
-
-	out float2 uv : UV,
-	out float3 normal : NORMAL,
-	out float3 wpos : WPOS,
-	out float3 view : VIEW,
-	out float4 screen_uv : SCREEN_UV,
-	out float4 shadow_map_uv : SHADOW_MAP_UV,
-	out float4 position : SV_Position
-) {
-	Vertex v = s_vertex_buffer[vertex_id];
-	float3 pos = lerp(v.position, v.origin, min(1,distance(c_campos, v.origin+c_relative_position)/(CHUNKW*3))) + c_relative_position;
-
-
-	wpos = pos/8;
-	uv = v.uv;
-	normal = v.normal;
-	view = pos - c_campos;
-
-	position = mul(c_mvp, float4(pos, 1.0f));
-	screen_uv = position * float4(1, -1, 1, 1);
-
-	shadow_map_uv = mul(light_vp_matrix, float4(pos, 1));
-}
-)"s);
-
-	grass_ps = create_ps(HLSL_CBUFFER HLSL_COMMON HLSL_LIGHTING HLSL_TRIPLANAR R"(
-void main(
-	in float2 uv : UV,
-	in float3 normal : NORMAL,
-	in float3 wpos : WPOS,
-	in float3 view : VIEW,
-	in float4 screen_uv : SCREEN_UV,
-	in float4 shadow_map_uv : SHADOW_MAP_UV,
-
-	out float4 pixel_color : SV_Target
-) {
-	float4 colortex = albedo_texture.Sample(default_sampler, uv);
-
-	clip(colortex.a-0.5f);
-
-	float3 albedo = colortex.rgb * float3(.6,.9,.2)*.8;
-
-
-	float3 L = c_ldir;
-	float3 N = normal;
-
-	float3 V = -normalize(view);
-	float3 H = normalize(V + L);
-
-	float NV = max(dot(N, V), 0.25f);
-	float NL = max(dot(N, L), 1e-3f);
-	float NH = max(dot(N, H), 1e-3f);
-	float VH = max(dot(V, H), 1e-3f);
-
-	float metalness = 0;
-	float roughness = 1;
-
-	screen_uv = (screen_uv / screen_uv.w) * 0.5 + 0.5;
-	float3 ambient_color = sky_texture.Sample(default_sampler, screen_uv.xy);
-
-	float3 F0 = 0.04;
-	F0 = lerp(F0, albedo, metalness);
-
-	float D = trowbridge_reitz_ggx(NH, roughness);
-	float G = smith_schlick(NV, NL, k_direct(roughness));
-	float3 F = fresnel_schlick(NV, F0);
-	float3 specular = cook_torrance(D, F, G, NV, NL);
-	float3 diffuse = albedo * NL * (1 - metalness) / pi * (1 - specular);
-
-	float3 ambient_specular = ambient_color * F * smith_schlick(NV, 1, k_ibl(roughness));
-	float3 ambient_diffuse = albedo * ambient_color * (1-ambient_specular);
-	float3 ambient = (ambient_diffuse + ambient_specular) / pi;
-
-
-	shadow_map_uv /= shadow_map_uv.w;
-	shadow_map_uv.y *= -1;
-	float shadow_mask = saturate(map(length(shadow_map_uv.xyz), 0.9, 1, 0, 1));
-	shadow_map_uv = shadow_map_uv * 0.5 + 0.5;
-
-	float lightness = lerp(shadow_texture.SampleCmpLevelZero(shadow_sampler, shadow_map_uv.xy, shadow_map_uv.z).x, 1, shadow_mask);
-	pixel_color.rgb = ambient + (diffuse + specular) * lightness;
-	pixel_color.a = 1;
-
-	float fog = min(1, length(view) / (CHUNKW*FARD));
-	fog *= fog;
-	fog *= fog;
-	pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
-
-	//pixel_color = shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01);
-	//pixel_color = shadowtex.Sample(sam, shadow_map_uv.xy);
-
-}
-)"s);
-
-	chunk_block_vs = create_vs(HLSL_CBUFFER HLSL_COMMON R"(
-struct Vertex {
-	float3 position;
-	uint normal;
-};
-
-StructuredBuffer<Vertex> s_vertex_buffer : VERTEX_BUFFER_SLOT;
-
-void main(
-	in uint vertex_id : SV_VertexID,
-
-	out float3 normal : NORMAL,
-	out float3 color : COLOR,
-	out float3 wpos : WPOS,
-	out float3 view : VIEW,
-	out float4 screen_uv : SCREEN_UV,
-	out float4 shadow_map_uv : SHADOW_MAP_UV,
-	out float4 position : SV_Position
-) {
-	float3 pos = s_vertex_buffer[vertex_id].position + c_relative_position;
-	wpos = pos;
-	normal = decode_normal(s_vertex_buffer[vertex_id].normal);
-	view = pos - c_campos;
-
-	if (c_was_remeshed == 0) {
-#if 0
-		// random color per chunk
-		color = frac(c_actual_position * float3(1.23, 5.67, 8.9));
-		color += color.zxy * float3(1.23, 5.67, 8.9);
-		color += color.zxy * float3(1.23, 5.67, 8.9);
-		color = frac(color+0.1f);
-#else
-		// ground color
-		color = 1;
-#endif
-	} else {
-		color = 1;
-		//color = float3(0,0,1);
-	}
-
-	position = mul(c_mvp, float4(pos, 1.0f));
-	screen_uv = position * float4(1, -1, 1, 1);
-
-	shadow_map_uv = mul(light_vp_matrix, float4(pos, 1));
-}
-)"s);
-
-	chunk_block_ps = create_ps(HLSL_CBUFFER HLSL_COMMON HLSL_LIGHTING HLSL_TRIPLANAR R"(
-void main(
-	in float3 normal : NORMAL,
-	in float3 color_ : COLOR,
-	in float3 wpos : WPOS,
-	in float3 view : VIEW,
-	in float4 screen_uv : SCREEN_UV,
-	in float4 shadow_map_uv : SHADOW_MAP_UV,
-
-	out float4 pixel_color : SV_Target
-) {
-	normal = normalize(normal);
-
-	float3 L = c_ldir;
-	float3 N = float4(triplanar_normal(normal_texture, default_sampler, wpos, normal), 1);
-
-	float3 V = -normalize(view);
-	float3 H = normalize(V + L);
-
-	float NV = max(dot(N, V), 1e-3f);
-	float NL = max(dot(N, L), 1e-3f);
-	float NH = max(dot(N, H), 1e-3f);
-	float VH = max(dot(V, H), 1e-3f);
-
-	float3 albedo = triplanar(albedo_texture, default_sampler, wpos, normal).xyz;
-
-	float metalness = 0;
-	float roughness = 1;
-
-	screen_uv = (screen_uv / screen_uv.w) * 0.5 + 0.5;
-	float3 ambient_color = sky_texture.Sample(default_sampler, screen_uv.xy);
-
-	float3 F0 = 0.04;
-	F0 = lerp(F0, albedo, metalness);
-
-	float D = trowbridge_reitz_ggx(NH, roughness);
-	float G = smith_schlick(NV, NL, k_direct(roughness));
-	float3 F = fresnel_schlick(NV, F0);
-	float3 specular = cook_torrance(D, F, G, NV, NL);
-	float3 diffuse = albedo * NL * (1 - metalness) / pi * (1 - specular);
-
-	float3 ambient_specular = ambient_color * F * smith_schlick(NV, 1, k_ibl(roughness));
-	float3 ambient_diffuse = albedo * ambient_color * (1-ambient_specular);
-	float3 ambient = ambient_diffuse / pi + ambient_specular;
-
-
-	shadow_map_uv /= shadow_map_uv.w;
-	shadow_map_uv.y *= -1;
-	float shadow_mask = saturate(map(length(shadow_map_uv.xyz), 0.9, 1, 0, 1));
-	shadow_map_uv = shadow_map_uv * 0.5 + 0.5;
-
-	float lightness = lerp(shadow_texture.SampleCmpLevelZero(shadow_sampler, shadow_map_uv.xy, shadow_map_uv.z).x, 1, shadow_mask);
-	pixel_color.rgb = ambient + (diffuse + specular) * lightness;
-	pixel_color.a = 1;
-
-	float fog = min(1, length(view) / (CHUNKW*FARD));
-	fog *= fog;
-	fog *= fog;
-	pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
-
-	//pixel_color = shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01);
-	//pixel_color = shadowtex.Sample(sam, shadow_map_uv.xy);
-
-}
-)"s);
-
-	tree_vs = create_vs(HLSL_CBUFFER R"(
-struct Vertex {
-	float3 position;
-	float3 normal;
-	float4 tangent;
-	float4 color;
-	float2 uv;
-};
-
-StructuredBuffer<Vertex> s_vertex_buffer : VERTEX_BUFFER_SLOT;
-
-struct Instance {
-	float3x3 mat;
-	float3 position;
-};
-
-StructuredBuffer<Instance> s_instance_buffer : INSTANCE_BUFFER_SLOT;
-
-void main(
-	in uint vertex_id : SV_VertexID,
-	in uint instance_id : SV_InstanceID,
-
-	out float3 normal : NORMAL,
-	out float4 tangent : TANGENT,
-	out float3 color : COLOR,
-	out float2 uv : UV,
-	out float3 wpos : WPOS,
-	out float3 view : VIEW,
-	out float4 screen_uv : SCREEN_UV,
-	out float4 shadow_map_uv : SHADOW_MAP_UV,
-	out float4 position : SV_Position
-) {
-	Instance instance = s_instance_buffer[instance_id];
-	float3 pos = mul(instance.mat, s_vertex_buffer[vertex_id].position) + instance.position + c_relative_position;
-
-	wpos = pos;
-	normal = mul(instance.mat, float4(s_vertex_buffer[vertex_id].normal, 0)).xyz;
-	tangent = s_vertex_buffer[vertex_id].tangent;
-	view = pos - c_campos;
-
-	uv = s_vertex_buffer[vertex_id].uv;
-
-	if (c_was_remeshed == 0) {
-#if 0
-		// random color per chunk
-		color = frac(c_actual_position * float3(1.23, 5.67, 8.9));
-		color += color.zxy * float3(1.23, 5.67, 8.9);
-		color += color.zxy * float3(1.23, 5.67, 8.9);
-		color = frac(color+0.1f);
-#else
-		// ground color
-		color = 1;
-#endif
-	} else {
-		color = 1;
-		//color = float3(0,0,1);
-	}
-
-	position = mul(c_mvp, float4(pos, 1.0f));
-	screen_uv = position * float4(1, -1, 1, 1);
-
-	shadow_map_uv = mul(light_vp_matrix, float4(pos, 1));
-}
-)"s);
-
-	tree_ps = create_ps(HLSL_CBUFFER HLSL_COMMON HLSL_LIGHTING HLSL_TRIPLANAR R"(
-void main(
-	in float3 normal : NORMAL,
-	in float4 tangent : TANGENT,
-	in float3 color_ : COLOR,
-	in float2 uv : UV,
-	in float3 wpos : WPOS,
-	in float3 view : VIEW,
-	in float4 screen_uv : SCREEN_UV,
-	in float4 shadow_map_uv : SHADOW_MAP_UV,
-	in float4 pixel_position : SV_Position,
-
-	in bool vface : SV_IsFrontFace,
-
-	out float4 pixel_color : SV_Target
-) {
-	//clip(sign(c_lod_t) * (abs(c_lod_t) - lod_mask_texture.Sample(nearest_sampler, float3(pixel_position.xy,c_frame)/16).x));
-	clip(sign(c_lod_t) * (abs(c_lod_t) - lod_mask_texture.Sample(nearest_sampler, wpos).x));
-	//clip(sign(c_lod_t) * (abs(c_lod_t) - lod_mask_texture.Sample(nearest_sampler, float3(pixel_position.xy/16, 0).zxy).x));
-
-	normal = normalize(normal);
-
-	// FIXME: tangent is broken?
-
-	// // derivations of the fragment position
-	// float3 pos_dx = ddx( pixel_position );
-	// float3 pos_dy = ddy( pixel_position );
-	// // derivations of the texture coordinate
-	// float2 texC_dx = ddx( uv );
-	// float2 texC_dy = ddy( uv );
-	// // tangent vector and binormal vector
-	// float3 t = normalize(texC_dy.y * pos_dx - texC_dx.y * pos_dy);
-	// float3 b = normalize(texC_dx.x * pos_dy - texC_dy.x * pos_dx);
-
-	float3 L = c_ldir;
-	float3 N = world_normal(normalize(normal), tangent, normal_texture.Sample(default_sampler, uv), 1);
-	//N = lerp(N, L, 0.5);
-
-	float3 V = -normalize(view);
-	float3 H = normalize(V + L);
-
-	float NV = max(dot(N, V), 1e-3f);
-	float NL = max(dot(N, L), 1e-3f);
-	float NH = max(dot(N, H), 1e-3f);
-	float VH = max(dot(V, H), 1e-3f);
-
-#if 0
-	float3 data = albedo_texture.Sample(default_sampler, uv);
-	pixel_color.a = map_clamped(data.x, .7, .6, 0, 1) + data.z;
-
-	float3 albedo = lerp(
-		lerp(float3(.03,.12,.01), float3(.37,.80,.19),data.y),
-		lerp(float3(.12,.04,.01), float3(.80,.42,.19),data.y),
-		data.z
-	);
-#else
-	float4 data = albedo_texture.Sample(default_sampler, uv);
-	pixel_color.a = data.a * 2;
-	clip(pixel_color.a - 0.5);
-	float3 albedo = data.rgb;
-#endif
-
-	//pixel_color = float4(tangent.xyz * float3(-1,1,-1), 1);
-	//pixel_color = float4(N, 1);
-	//return;
-
-
-	float metalness = 0;
-	float roughness = 1;
-
-	screen_uv = (screen_uv / screen_uv.w) * 0.5 + 0.5;
-	float3 ambient_color = sky_texture.Sample(default_sampler, screen_uv.xy);
-
-	float3 F0 = 0.04;
-	F0 = lerp(F0, albedo, metalness);
-
-	float D = trowbridge_reitz_ggx(NH, roughness);
-	float G = smith_schlick(NV, NL, k_direct(roughness));
-	float3 F = fresnel_schlick(NV, F0);
-	float3 specular = 0;//cook_torrance(D, F, G, NV, NL);
-	float3 diffuse = albedo * NL * (1 - metalness) / pi;// * (1 - specular);
-
-	float3 ambient_specular = 0;//ambient_color * F * smith_schlick(NV, 1, k_ibl(roughness));
-	float3 ambient_diffuse = albedo * ambient_color * (1-ambient_specular);
-	float3 ambient = (ambient_diffuse / pi + ambient_specular) * ao_texture.Sample(default_sampler, uv).x;
-
-
-	shadow_map_uv /= shadow_map_uv.w;
-	shadow_map_uv.y *= -1;
-	float shadow_mask = saturate(map(length(shadow_map_uv.xyz), 0.9, 1, 0, 1));
-	shadow_map_uv = shadow_map_uv * 0.5 + 0.5;
-
-	float lightness = lerp(shadow_texture.SampleCmpLevelZero(shadow_sampler, shadow_map_uv.xy, shadow_map_uv.z).x, 1, shadow_mask);
-	pixel_color.rgb = ambient + (diffuse + specular) * lightness;
-
-	float fog = min(1, length(view) / (CHUNKW*FARD));
-	fog *= fog;
-	fog *= fog;
-	pixel_color.rgb = lerp(pixel_color.rgb, ambient_color, fog);
-
-	//pixel_color = shadowtex.SampleCmpLevelZero(dsam, shadow_map_uv.xy, shadow_map_uv.z-0.01);
-	//pixel_color = shadowtex.Sample(sam, shadow_map_uv.xy);
-}
-)"s);
-
-	tree_shadow_vs = create_vs(HLSL_CBUFFER R"(
-struct Vertex {
-	float3 position;
-	float3 normal;
-	float4 tangent;
-	float4 color;
-	float2 uv;
-};
-
-StructuredBuffer<Vertex> s_vertex_buffer : VERTEX_BUFFER_SLOT;
-
-struct Instance {
-	float3x3 mat;
-	float3 position;
-};
-
-StructuredBuffer<Instance> s_instance_buffer : INSTANCE_BUFFER_SLOT;
-
-
-void main(
-	in uint vertex_id : SV_VertexID,
-	in uint instance_id : SV_InstanceID,
-	out float2 uv : UV,
-	out float4 screen_uv : SCREEN_UV,
-	out float4 position : SV_Position
-) {
-	Instance instance = s_instance_buffer[instance_id];
-	float3 pos = mul(instance.mat, s_vertex_buffer[vertex_id].position) + instance.position + c_relative_position;
-	position = mul(c_mvp, float4(pos, 1.0f));
-	screen_uv = position * float4(1, -1, 1, 1);
-	uv = s_vertex_buffer[vertex_id].uv;
-}
-)"s);
-
-	tree_shadow_ps = create_ps(HLSL_CBUFFER HLSL_COMMON HLSL_LIGHTING HLSL_TRIPLANAR R"(
-void main(
-	in float2 uv : UV,
-	in float4 screen_uv : SCREEN_UV
-) {
-	float4 data = albedo_texture.Sample(default_sampler, uv);
-	clip(data.a - 0.5);
-}
-)"s);
-
+	void compile_shaders();
+	compile_shaders();
 
 
 	frame_cbuffer.init();
-	chunk_cbuffer.init();
+	entity_cbuffer.init();
+
+	{
+		u32 albedo[] {
+			0xffffffff
+		};
+		default_albedo = make_texture(albedo);
+	}
+	{
+		u32 normal[] { 0xffff8080 };
+		default_normal = make_texture(normal);
+	}
+	{
+		u32 ao[] { 0xffffffff };
+		default_ao = make_texture(ao);
+	}
 
 	{
 		D3D11_BLEND_DESC desc {
@@ -4891,6 +4792,14 @@ void main(
 			}
 		};
 		dhr(device->CreateBlendState(&desc, &font_blend));
+	}
+	{
+		D3D11_RASTERIZER_DESC desc {
+			.FillMode = D3D11_FILL_SOLID,
+			.CullMode = D3D11_CULL_BACK,
+			.ScissorEnable = true,
+		};
+		dhr(device->CreateRasterizerState(&desc, &scissor_rasterizer));
 	}
 	{
 		D3D11_RASTERIZER_DESC desc {
@@ -4983,6 +4892,22 @@ void main(
 		dhr(device->CreateSamplerState(&desc, &sampler));
 
 		immediate_context->PSSetSamplers(NEAREST_SAMPLER_SLOT, 1, &sampler);
+	}
+	{
+		D3D11_SAMPLER_DESC desc {
+			.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT,
+			.AddressU = D3D11_TEXTURE_ADDRESS_MIRROR,
+			.AddressV = D3D11_TEXTURE_ADDRESS_MIRROR,
+			.AddressW = D3D11_TEXTURE_ADDRESS_MIRROR,
+			.MaxAnisotropy = 16,
+			.MinLOD = 0,
+			.MaxLOD = max_value<f32>,
+		};
+
+		ID3D11SamplerState *sampler;
+		dhr(device->CreateSamplerState(&desc, &sampler));
+
+		immediate_context->PSSetSamplers(NEAREST_MIRROR_SAMPLER_SLOT, 1, &sampler);
 	}
 	{
 		D3D11_SAMPLER_DESC desc {
@@ -5085,7 +5010,7 @@ void main(
 	}
 
 	{
-		u8 pixels[16][16][16];
+		u8 pixels[64][64];
 		u8 i = 0;
 		for (auto &p : flatten(pixels)) {
 			p = i++;
@@ -5097,114 +5022,90 @@ void main(
 		immediate_context->PSSetShaderResources(LOD_MASK_TEXTURE_SLOT, 1, &lod_mask);
 	}
 
-	{
+	auto load_model = [&](char const *name) {
 		scoped_allocator(temporary_allocator);
-		auto scene = parse_glb_from_memory(read_entire_file(format("{}/spruce.glb", executable_directory)));
+		auto scene = parse_glb_from_memory(read_entire_file(format("{}/{}", executable_directory, name)));
 
-		auto create_model = [&](Span<utf8> name) {
-			auto mesh = find_if(scene.nodes, [&](auto &node) { return node.name == name; })->mesh;
-			return Model {
-				.vb = create_structured_buffer(mesh->vertices),
-				.ib = create_index_buffer(mesh->indices),
-				.index_count = (u32)mesh->indices.count,
-			};
+		List<Scene3D::Node *> lod_nodes;
+		List<BasicVertex> vertices;
+		List<u32> indices;
+
+		defer {
+			free(lod_nodes);
+			free(vertices);
+			free(indices);
 		};
 
-		tree_model.add_lod(0, create_model(u8"lod0"s)).no_cull = true;
-		tree_model.add_lod(1, create_model(u8"lod1"s)).no_cull = true;
-		tree_model.add_lod(2, create_model(u8"lod2"s)).no_cull = true;
-		tree_model.add_lod(3, create_model(u8"lod3"s)).no_cull = true;
-		tree_model.add_lod(4, create_model(u8"lod4"s)).no_cull = true;
-	}
+		LodModel result = {};
 
-	ID3D11ShaderResourceView *default_normal;
-	{
-		v4u8 normal[1][1] { 0x80, 0x80, 0xff, 0xff};
-		default_normal = make_texture(normal);
-	}
+		auto add_lod = [&](Scene3D::Node *node, LodModel::Lod lod = {}) {
+			auto mesh = node->mesh;
 
-	ID3D11ShaderResourceView *default_ao;
-	{
-		v4u8 ao[1][1] { 0xff, 0xff, 0xff, 0xff};
-		default_ao = make_texture(ao);
-	}
+			u32 index_count = mesh->indices.count;
+			u32 start_index  = indices.count;
+			u32 start_vertex = vertices.count;
 
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\ground_albedo.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		ground_albedo = make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\ground_normal.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		ground_normal = make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\grass.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		grass_albedo = make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\planks.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		planks_albedo = make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\planks_normal.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		planks_normal = make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\spruce_albedo.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		tree_model.lods[0].model.albedo =
-		tree_model.lods[1].model.albedo =
-		tree_model.lods[2].model.albedo = make_texture(pixels, w, h);
-	}
-	{
-		// int w,h;
-		// auto pixels = stbi_load(tformat("{}\\tree_normal.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		// defer { stbi_image_free(pixels); };
-		// tree_normal = make_texture(pixels, w, h);
-		tree_model.lods[0].model.normal =
-		tree_model.lods[1].model.normal =
-		tree_model.lods[2].model.normal = default_normal;
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\spruce_ao.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		tree_model.lods[0].model.ao =
-		tree_model.lods[1].model.ao =
-		tree_model.lods[2].model.ao = make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\spruce_lod2_albedo.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		tree_model.lods[3].model.albedo =
-		tree_model.lods[4].model.albedo = make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\spruce_lod2_normal.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		tree_model.lods[3].model.normal =
-		tree_model.lods[4].model.normal = default_normal;//make_texture(pixels, w, h);
-	}
-	{
-		int w,h;
-		auto pixels = stbi_load(tformat("{}\\spruce_lod2_ao.png\0"s, executable_directory).data, &w, &h, 0, 4);
-		defer { stbi_image_free(pixels); };
-		tree_model.lods[3].model.ao =
-		tree_model.lods[4].model.ao = make_texture(pixels, w, h);
-	}
+			lod.index_count = index_count;
+			lod.start_index  = start_index;
+			lod.start_vertex = start_vertex;
+			result.lods.add(lod);
+
+			for (auto v : mesh->vertices) {
+				vertices.add({
+					.position = v.position,
+					.normal   = v.normal,
+					.uv       = v.uv,
+					.tangent  = v.tangent,
+				});
+			}
+			indices.add(mesh->indices);
+		};
+
+		for (auto &node : scene.nodes) {
+			if (starts_with(node.name, u8"lod"s)) {
+				lod_nodes.add(&node);
+			}
+		}
+
+		for (auto node : lod_nodes) {
+			add_lod(node, {
+				.end_distance = (u32)parse_u64(node->name.subspan(3, 1)).value(),
+				.cast_shadow = node->name[4] == 'y',
+			});
+		}
+
+		std::sort(result.lods.begin(), result.lods.end(), [&](LodModel::Lod a, LodModel::Lod b) {
+			return a.end_distance < b.end_distance;
+		});
+
+		result.vertex_buffer = create_structured_buffer(vertices);
+		result.index_buffer  = create_index_buffer(indices);
+
+		result.no_cull = true;
+
+		return result;
+	};
+
+	tree_model = load_model("spruce.glb");
+	grenade_model = load_model("grenade.glb");
+
+	struct ReloadableTexture {
+		char const *path;
+		FileTime last_write_time;
+		ID3D11ShaderResourceView **srv;
+	};
+
+	StaticList<ReloadableTexture, 16> textures;
+
+	textures.add({.path = format("{}\\ground_albedo.png\0"s, executable_directory).data, .srv = &ground_albedo});
+	textures.add({.path = format("{}\\ground_normal.png\0"s, executable_directory).data, .srv = &ground_normal});
+	textures.add({.path = format("{}\\grass.png\0"s, executable_directory).data, .srv = &grass_albedo});
+	textures.add({.path = format("{}\\planks.png\0"s, executable_directory).data, .srv = &planks_albedo});
+	textures.add({.path = format("{}\\planks_normal.png\0"s, executable_directory).data, .srv = &planks_normal});
+	textures.add({.path = format("{}\\spruce_albedo.png\0"s, executable_directory).data, .srv = &tree_model.albedo});
+	textures.add({.path = format("{}\\spruce_normal.png\0"s, executable_directory).data, .srv = &tree_model.normal});
+	textures.add({.path = format("{}\\spruce_ao.png\0"s, executable_directory).data,     .srv = &tree_model.ao});
+
 	{
 		ID3D11Texture2D *tex;
 		defer { tex->Release(); };
@@ -5293,9 +5194,16 @@ void main(
 		return texture;
 	};
 
-	camera = &create_entity();
-	camera_prev_position = camera->position = {0,-3,0};
+	p::PhysicsWorld::WorldSettings settings;
+	settings.defaultBounciness = 0;
+	physics_world = physics.createPhysicsWorld(settings);
+	physics_world->setIsDebugRenderingEnabled(true);
 
+	camera = create_entity();
+	camera->position = {0,-3,0};
+	auto &camera_physics = camera->add_component<PhysicsComponent>();
+	camera_physics.collider = camera_physics.body->addCollider(physics.createCapsuleShape(.2, 1), {});
+	camera_physics.body->setAngularLockAxisFactor({1,1,1});
 
 	start();
 
@@ -5310,17 +5218,20 @@ void main(
 	the_timer = create_precise_timer();
 
     while (1) {
-		profile_frame = key_held('T');
-		if (profile_frame) {
-			profiler.reset();
+		for (auto &t : textures) {
+			auto status = detect_change(t.path, &t.last_write_time);
+			if (status.failed) {
+				print("detect status failed {}\n", t.path);
+			}
+			if (status.changed) {
+				int w,h;
+				auto pixels = stbi_load(t.path, &w, &h, 0, 4);
+				defer { stbi_image_free(pixels); };
+				if (*t.srv)
+					(*t.srv)->Release();
+				*t.srv = make_texture(pixels, w, h);
+			}
 		}
-		defer {
-			if (profile_frame)
-				write_entire_file("frame.tmd"s, (Span<u8>)profiler.output_for_timed());
-			profile_frame = false;
-		};
-
-		timed_block(profiler, profile_frame, "frame");
 
 		MSG message;
 		mouse_delta = {};
@@ -5398,9 +5309,44 @@ void main(
 		}
 
 
-		update();
+		if (key_down('G')) {
+			show_profile = !show_profile;
+		}
 
-		swap_chain->Present(1, 0);
+		profile_frame = key_held('T');
+		if (profile_frame) {
+			show_profile = true;
+			profiler.reset();
+		}
+		defer {
+			if (profile_frame) {
+				previous_frame_profile.set(profiler.recorded_time_spans);
+				for (auto &span : previous_frame_profile) {
+					assert(span.begin >= profiler.start_time);
+					assert(span.end   >= profiler.start_time);
+					span.begin -= profiler.start_time;
+					span.end   -= profiler.start_time;
+				}
+
+				std::sort(previous_frame_profile.begin(), previous_frame_profile.end(), [&](Profiler::TimeSpan a, Profiler::TimeSpan b) {
+					if (a.thread_id != b.thread_id)
+						return a.thread_id < b.thread_id;
+
+					if (a.begin != b.begin)
+						return a.begin < b.begin;
+
+					return a.end < b.end;
+				});
+
+				write_entire_file("frame.tmd"s, (Span<u8>)profiler.output_for_timed());
+			}
+			profile_frame = false;
+		};
+
+		timed_block(profiler, profile_frame, "frame");
+
+		update();
+		swap_chain->Present(0, 0);
 
 		for (auto &state : key_state) {
 			if (state & KeyState_up) {

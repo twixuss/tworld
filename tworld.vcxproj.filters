@@ -3,10 +3,12 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\grid_map.cpp" />
+    <ClCompile Include="src\shaders.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\d3d11.h" />
     <ClInclude Include="src\input.h" />
+    <ClInclude Include="src\shaders.h" />
     <ClInclude Include="src\common.h" />
   </ItemGroup>
   <ItemGroup>
